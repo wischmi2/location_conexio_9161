@@ -5,10 +5,17 @@
 #
 
 config WIFI_NRF70
+	bool
 	default y if BOARD_THINGY91X_NRF9151_NS
 
 choice WIFI_NRF70_OPER_MODES
+	bool "Wi-Fi nRF70 operating modes"
+	depends on WIFI_NRF70
 	default WIFI_NRF70_SCAN_ONLY if BOARD_THINGY91X_NRF9151_NS
+
+config WIFI_NRF70_SCAN_ONLY
+	bool "Scan only"
+
 endchoice
 
 source "share/sysbuild/Kconfig"

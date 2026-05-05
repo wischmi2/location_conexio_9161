@@ -1,0 +1,33 @@
+# Conexio Stratus Pro board configuration
+
+# SPDX-License-Identifier: Apache-2.0
+
+config HW_STACK_PROTECTION
+	default ARCH_HAS_STACK_PROTECTION
+
+if BOARD_CONEXIO_STRATUS_PRO_NRF9161 || BOARD_CONEXIO_STRATUS_PRO_NRF9161_NS
+
+config BOARD_CONEXIO_STRATUS_PRO
+	select USE_DT_CODE_PARTITION if BOARD_CONEXIO_STRATUS_PRO_NRF9161_NS
+
+config BOOTLOADER_MCUBOOT
+	default y if !MCUBOOT
+
+# Workaround for not being able to have commas in macro arguments.
+DT_CHOSEN_Z_CODE_PARTITION := zephyr,code-partition
+
+config FLASH_LOAD_SIZE
+	default $(dt_chosen_reg_size_hex,$(DT_CHOSEN_Z_CODE_PARTITION))
+	depends on BOARD_CONEXIO_STRATUS_PRO_NRF9161 && TRUSTED_EXECUTION_SECURE
+
+if BOARD_CONEXIO_STRATUS_PRO_NRF9161_NS
+
+config FLASH_LOAD_OFFSET
+	default $(dt_chosen_reg_addr_hex,$(DT_CHOSEN_Z_CODE_PARTITION))
+
+config FLASH_LOAD_SIZE
+	default $(dt_chosen_reg_size_hex,$(DT_CHOSEN_Z_CODE_PARTITION))
+
+endif # BOARD_CONEXIO_STRATUS_PRO_NRF9161_NS
+
+endif # BOARD_CONEXIO_STRATUS_PRO_NRF9161 || BOARD_CONEXIO_STRATUS_PRO_NRF9161_NS

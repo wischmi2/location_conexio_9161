@@ -1,0 +1,6 @@
+# Conexio Stratus Pro board configuration
+
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_CONEXIO_STRATUS_PRO
+	select SOC_NRF9161_LACA
