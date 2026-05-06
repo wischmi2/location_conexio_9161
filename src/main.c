@@ -6,6 +6,7 @@
 
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
 #include <zephyr/kernel.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
@@ -21,11 +22,63 @@
 #include <zephyr/net/socket.h>
 #include <zcbor_encode.h>
 
-#define GOLIOTH_PSK_ID "stratus9161-psk@emerald-mature-damselfly"
-#define GOLIOTH_PSK    "keyforthe9161"
+#define GOLIOTH_PSK_ID CONFIG_GOLIOTH_SAMPLE_PSK_ID
+#define GOLIOTH_PSK    CONFIG_GOLIOTH_SAMPLE_PSK
 
 static struct golioth_client *golioth_client;
 static K_SEM_DEFINE(golioth_connected_sem, 0, 1);
+
+static const struct golioth_client_config golioth_cfg = {
+	.credentials = {
+		.auth_type = GOLIOTH_TLS_AUTH_TYPE_TAG,
+		.tag = CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG,
+	},
+};
+
+static int golioth_provision_psk_credentials(void)
+{
+	char psk_hex[(sizeof(GOLIOTH_PSK) - 1) * 2 + 1];
+	const char hex_digits[] = "0123456789abcdef";
+	const char *psk = GOLIOTH_PSK;
+	int err;
+
+	for (size_t i = 0; i < sizeof(GOLIOTH_PSK) - 1; i++) {
+		unsigned char value = (unsigned char)psk[i];
+
+		psk_hex[i * 2] = hex_digits[value >> 4];
+		psk_hex[i * 2 + 1] = hex_digits[value & 0x0f];
+	}
+	psk_hex[sizeof(psk_hex) - 1] = '\0';
+
+	/* Ignore delete failures when the credentials do not exist yet. */
+	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,4",
+				 CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,3",
+				 CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+
+	err = nrf_modem_at_printf("AT%%CMNG=0,%d,4,\"%s\"",
+				  CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG,
+				  GOLIOTH_PSK_ID);
+	if (err) {
+		printk("[golioth] failed to provision PSK ID to sec tag %d: %d\n",
+		       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG, err);
+		return err;
+	}
+
+	err = nrf_modem_at_printf("AT%%CMNG=0,%d,3,\"%s\"",
+				  CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG,
+				  psk_hex);
+	if (err) {
+		printk("[golioth] failed to provision PSK to sec tag %d: %d\n",
+		       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG, err);
+		return err;
+	}
+
+	printk("[golioth] provisioned PSK credentials to sec tag %d\n",
+	       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+
+	return 0;
+}
 
 static void golioth_on_client_event(struct golioth_client *client,
 				     enum golioth_client_event event,
@@ -49,35 +102,58 @@ static void publish_location_to_golioth(const struct location_event_data *event_
 		return;
 	}
 
-	uint8_t buf[64];
-	ZCBOR_STATE_E(zs, 1, buf, sizeof(buf), 1);
+	char payload[196];
+	int len = snprintk(payload, sizeof(payload),
+		"{\"lat\":%.6f,\"lon\":%.6f,\"acc\":%.1f,\"method\":\"%s\"}",
+		event_data->location.latitude,
+		event_data->location.longitude,
+		(double)event_data->location.accuracy,
+		location_method_str(event_data->method));
 
-	bool ok = zcbor_map_start_encode(zs, 3)
-		&& zcbor_tstr_put_lit(zs, "lat")
-		&& zcbor_float64_put(zs, event_data->location.latitude)
-		&& zcbor_tstr_put_lit(zs, "lon")
-		&& zcbor_float64_put(zs, event_data->location.longitude)
-		&& zcbor_tstr_put_lit(zs, "acc")
-		&& zcbor_float32_put(zs, event_data->location.accuracy)
-		&& zcbor_map_end_encode(zs, 3);
-
-	if (!ok) {
-		printk("Failed to encode location CBOR\n");
+	if (len <= 0 || len >= (int)sizeof(payload)) {
+		printk("[golioth] failed to encode location JSON\n");
 		return;
 	}
 
-	size_t payload_len = zs->payload - buf;
-	printk("[golioth] publishing location payload, len=%u\n", (unsigned int)payload_len);
+	printk("[golioth] publishing location JSON to path 'loc/fix': %s\n", payload);
 
 	enum golioth_status status = golioth_stream_set(golioth_client,
-							"data",
-							GOLIOTH_CONTENT_TYPE_CBOR,
-							buf, payload_len,
+							"loc/fix",
+							GOLIOTH_CONTENT_TYPE_JSON,
+							payload, len,
 							NULL, NULL);
 	if (status != GOLIOTH_OK) {
 		printk("Failed to publish location to Golioth: %d\n", status);
 	} else {
-		printk("Location published to Golioth\n");
+		printk("Location published to Golioth path 'loc/fix'\n");
+	}
+}
+
+static void publish_status_to_golioth(const char *state, int32_t code)
+{
+	if (!golioth_client) {
+		printk("[golioth] status publish skipped: client not initialized\n");
+		return;
+	}
+
+	char payload[128];
+	int len = snprintk(payload, sizeof(payload),
+		"{\"state\":\"%s\",\"code\":%d}", state, (int)code);
+
+	if (len <= 0 || len >= (int)sizeof(payload)) {
+		printk("[golioth] failed to encode status JSON\n");
+		return;
+	}
+
+	enum golioth_status status = golioth_stream_set(golioth_client,
+							"loc/stat",
+							GOLIOTH_CONTENT_TYPE_JSON,
+							payload, len,
+							NULL, NULL);
+	if (status != GOLIOTH_OK) {
+		printk("[golioth] failed to publish status '%s': %d\n", state, status);
+	} else {
+		printk("[golioth] status published to path 'loc/stat': %s (%d)\n", state, code);
 	}
 }
 #endif /* CONFIG_GOLIOTH_FIRMWARE_SDK */
@@ -235,24 +311,37 @@ static void location_event_handler(const struct location_event_data *event_data)
 		printk("  Google maps URL: https://maps.google.com/?q=%.06f,%.06f\n\n",
 			event_data->location.latitude, event_data->location.longitude);
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("location_fix", 0);
 		publish_location_to_golioth(event_data);
 #endif
 		break;
 
 	case LOCATION_EVT_TIMEOUT:
 		printk("Getting location timed out\n\n");
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("location_timeout", -ETIMEDOUT);
+#endif
 		break;
 
 	case LOCATION_EVT_ERROR:
 		printk("Getting location failed\n\n");
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("location_error", -EIO);
+#endif
 		break;
 
 	case LOCATION_EVT_GNSS_ASSISTANCE_REQUEST:
 		printk("Getting location assistance requested (A-GNSS). Not doing anything.\n\n");
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("agnss_request", 0);
+#endif
 		break;
 
 	case LOCATION_EVT_GNSS_PREDICTION_REQUEST:
 		printk("Getting location assistance requested (P-GPS). Not doing anything.\n\n");
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("pgps_request", 0);
+#endif
 		break;
 
 	default:
@@ -351,6 +440,7 @@ static void location_gnss_high_accuracy_get(void)
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 	config.methods[0].gnss.accuracy = LOCATION_ACCURACY_HIGH;
+	config.methods[0].gnss.timeout = 8 * 60 * MSEC_PER_SEC;
 
 	printk("Requesting high accuracy GNSS location...\n");
 
@@ -392,18 +482,19 @@ static void location_wifi_get(void)
 #endif
 
 /**
- * @brief Retrieve location periodically with GNSS as first priority and cellular as second.
+ * @brief Retrieve location periodically using GNSS only.
  */
 static void location_gnss_periodic_get(void)
 {
 	int err;
 	struct location_config config;
-	enum location_method methods[] = {LOCATION_METHOD_GNSS, LOCATION_METHOD_CELLULAR};
+	enum location_method methods[] = {LOCATION_METHOD_GNSS};
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 	config.interval = 30;
+	config.methods[0].gnss.timeout = 4 * 60 * MSEC_PER_SEC;
 
-	printk("Requesting 30s periodic GNSS location with cellular fallback...\n");
+	printk("Requesting 30s periodic GNSS location...\n");
 
 	err = location_request(&config);
 	if (err) {
@@ -441,6 +532,17 @@ int main(void)
 	printk("[lte] registering LTE event handler\n");
 	lte_lc_register_handler(lte_event_handler);
 
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	/*
+	 * nRF91 offloaded DTLS uses modem sec tags. Provision the PSK credentials
+	 * before LTE activation so the secure tag is ready for the DTLS session.
+	 */
+	err = golioth_provision_psk_credentials();
+	if (err) {
+		return err;
+	}
+#endif
+
 	if (!lte_is_registered()) {
 		printk("[lte] requesting LTE connection\n");
 		err = lte_lc_connect();
@@ -464,29 +566,17 @@ int main(void)
 		return err;
 	}
 
-	static const struct golioth_client_config golioth_cfg = {
-		.credentials = {
-			.auth_type = GOLIOTH_TLS_AUTH_TYPE_PSK,
-			.psk = {
-				.psk_id = GOLIOTH_PSK_ID,
-				.psk_id_len = sizeof(GOLIOTH_PSK_ID) - 1,
-				.psk = GOLIOTH_PSK,
-				.psk_len = sizeof(GOLIOTH_PSK) - 1,
-			},
-		},
-	};
-
-	printk("Connecting to Golioth...\n");
-	printk("[golioth] creating client for PSK-ID: %s\n", GOLIOTH_PSK_ID);
-	printk("[golioth] PSK-ID len=%u PSK len=%u\n",
-	       (unsigned int)golioth_cfg.credentials.psk.psk_id_len,
-	       (unsigned int)golioth_cfg.credentials.psk.psk_len);
+	printk("[golioth] creating client after LTE/network readiness\n");
 	golioth_client = golioth_client_create(&golioth_cfg);
 	if (!golioth_client) {
 		printk("[golioth] client create returned NULL\n");
 		return -ENOMEM;
 	}
 	printk("[golioth] client created: %p\n", golioth_client);
+
+	printk("Connecting to Golioth...\n");
+	printk("[golioth] using sec tag %d\n",
+	       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
 
 	golioth_client_register_event_callback(golioth_client, golioth_on_client_event, NULL);
 	printk("[golioth] waiting up to 60 seconds for connection\n");
@@ -496,6 +586,8 @@ int main(void)
 
 	if (golioth_ret == -EAGAIN) {
 		printk("Timed out waiting for Golioth connection, continuing anyway\n");
+	} else {
+		publish_status_to_golioth("golioth_connected", 0);
 	}
 #endif /* CONFIG_GOLIOTH_FIRMWARE_SDK */
 
@@ -521,15 +613,6 @@ int main(void)
 		return -1;
 	}
 	printk("[location] Location library initialized\n");
-
-	/* The fallback case is run first, otherwise GNSS might get a fix even with a 1 second
-	 * timeout.
-	 */
-	location_with_fallback_get();
-
-	location_default_get();
-
-	location_gnss_low_accuracy_get();
 
 	location_gnss_high_accuracy_get();
 

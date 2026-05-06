@@ -6,6 +6,20 @@
 
 menu "Location sample"
 
+config GOLIOTH_SAMPLE_PSK_ID
+	string "Golioth PSK Identity"
+	default ""
+	help
+	  PSK Identity used to authenticate with Golioth (e.g. device-id@project).
+	  Set this in a local credentials.conf file, not in tracked source.
+
+config GOLIOTH_SAMPLE_PSK
+	string "Golioth PSK"
+	default ""
+	help
+	  Pre-shared key used to authenticate with Golioth.
+	  Set this in a local credentials.conf file, not in tracked source.
+
 endmenu
 
 menu "Zephyr Kernel"

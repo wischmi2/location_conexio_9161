@@ -132,3 +132,38 @@ Untracked files relevant to this effort include:
 - Build path has progressed from an earlier TF-M failure to successful full image generation.
 - Golioth integration code and overlay are now present.
 - The remaining work is mainly runtime verification on hardware/network and cleanup of warnings/security hardening (especially credentials and signing key handling).
+
+## 9. Latest updates (May 6, 2026)
+
+The following reflects the most recent stabilization pass and build verification.
+
+### What was confirmed as fixed
+
+- Sysbuild + MCUboot flow now completes end-to-end and produces signed artifacts.
+- Application image links successfully after prior TF-M include/path issues.
+- The location app build and the MCUboot build both complete in the same run.
+- Final artifacts are generated, including merged image outputs and DFU package files.
+
+### Configuration and integration state now in place
+
+- Golioth enablement remains active through overlay-golioth.conf.
+- Network path remains pinned to an LTE-friendly IPv4 setup for modem offload behavior.
+- Golioth publish path in src/main.c remains wired to LOCATION_EVT_LOCATION with CBOR payload stream publishing.
+- Sysbuild/MCUboot settings remain in place to keep bootloader integration stable.
+
+### Current non-blocking warnings still present
+
+- Deprecated symbols still reported:
+  - NRF_CLOUD_REST
+  - MBEDTLS_LEGACY_CRYPTO_C
+- MCUboot warning about use of default debug signing key.
+- Partition manager warning about running bootloader flow without pm_static.yml.
+
+These do not block builds but should be treated as production hardening items.
+
+### Immediate next hardening actions
+
+- Replace default MCUboot signing key with project-owned key material.
+- Add a fixed pm_static.yml partition map for upgrade-safe releases.
+- Remove or replace deprecated Kconfig symbols where possible.
+- Perform on-device runtime verification of LTE attach, DNS, Golioth connect, and stream upload.

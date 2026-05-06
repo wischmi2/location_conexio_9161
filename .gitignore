@@ -4,3 +4,7 @@
 
 # build
 /build*/
+
+# local credentials - never commit
+credentials.conf
+*.credentials.conf
