@@ -20,6 +20,19 @@ config GOLIOTH_SAMPLE_PSK
 	  Pre-shared key used to authenticate with Golioth.
 	  Set this in a local credentials.conf file, not in tracked source.
 
+config GPS_SAMPLE_ANTENNA_ONBOARD
+	bool "Enable onboard GNSS antenna power via COEX0"
+	default n
+	help
+	  Send a modem AT command at startup to enable the onboard GNSS
+	  antenna/LNA power path on boards that require COEX0 control.
+
+config GPS_SAMPLE_AT_COEX0
+	string "AT command used to enable onboard GNSS antenna"
+	default "AT\%XCOEX0=1,1,1565,1586"
+	help
+	  AT command sent when GPS_SAMPLE_ANTENNA_ONBOARD is enabled.
+
 endmenu
 
 menu "Zephyr Kernel"

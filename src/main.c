@@ -164,6 +164,59 @@ static K_SEM_DEFINE(lte_connected, 0, 1);
 
 static K_SEM_DEFINE(time_update_finished, 0, 1);
 
+static struct k_work_delayable gnss_progress_work;
+static bool gnss_debug_active;
+static int64_t gnss_debug_start_ms;
+
+static void log_modem_snapshot(const char *cmd, const char *tag)
+{
+	char rsp[192];
+	int err = nrf_modem_at_cmd(rsp, sizeof(rsp), "%s", cmd);
+
+	if (err) {
+		printk("[gnss] %s query failed (%d)\n", tag, err);
+		return;
+	}
+
+	printk("[gnss] %s: %s\n", tag, rsp);
+}
+
+static void gnss_progress_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!gnss_debug_active) {
+		return;
+	}
+
+	int64_t elapsed_s = (k_uptime_get() - gnss_debug_start_ms) / MSEC_PER_SEC;
+
+	printk("[gnss] waiting for fix... elapsed=%lld s\n", elapsed_s);
+	log_modem_snapshot("AT+CSCON?", "CSCON");
+	log_modem_snapshot("AT%XMONITOR", "XMONITOR");
+
+	k_work_reschedule(&gnss_progress_work, K_SECONDS(30));
+}
+
+static void gnss_progress_start(const char *context)
+{
+	gnss_debug_active = true;
+	gnss_debug_start_ms = k_uptime_get();
+	printk("[gnss] progress debug started (%s)\n", context);
+	k_work_reschedule(&gnss_progress_work, K_SECONDS(30));
+}
+
+static void gnss_progress_stop(const char *reason)
+{
+	if (!gnss_debug_active) {
+		return;
+	}
+
+	gnss_debug_active = false;
+	k_work_cancel_delayable(&gnss_progress_work);
+	printk("[gnss] progress debug stopped (%s)\n", reason);
+}
+
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
 static int wait_for_golioth_dns(void)
 {
@@ -285,6 +338,25 @@ static bool lte_is_registered(void)
 	       (status == LTE_LC_NW_REG_REGISTERED_ROAMING);
 }
 
+static int enable_onboard_gnss_antenna_if_needed(void)
+{
+#if defined(CONFIG_GPS_SAMPLE_ANTENNA_ONBOARD)
+	static const char coex0_cmd[] = "AT%XCOEX0=1,1,1565,1586";
+	int err = nrf_modem_at_printf("%s", coex0_cmd);
+
+	if (err) {
+		printk("[gnss] failed to enable onboard antenna with '%s': %d\n",
+		       coex0_cmd, err);
+		return err;
+	}
+
+	printk("[gnss] onboard antenna enabled using '%s'\n",
+	       coex0_cmd);
+#endif
+
+	return 0;
+}
+
 static void location_event_handler(const struct location_event_data *event_data)
 {
 	printk("[location] event id=%d method=%s\n",
@@ -292,6 +364,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 
 	switch (event_data->id) {
 	case LOCATION_EVT_LOCATION:
+		gnss_progress_stop("fix");
 		printk("Got location:\n");
 		printk("  method: %s\n", location_method_str(event_data->method));
 		printk("  latitude: %.06f\n", event_data->location.latitude);
@@ -317,6 +390,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 
 	case LOCATION_EVT_TIMEOUT:
+		gnss_progress_stop("timeout");
 		printk("Getting location timed out\n\n");
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
 		publish_status_to_golioth("location_timeout", -ETIMEDOUT);
@@ -324,6 +398,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 
 	case LOCATION_EVT_ERROR:
+		gnss_progress_stop("error");
 		printk("Getting location failed\n\n");
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
 		publish_status_to_golioth("location_error", -EIO);
@@ -450,6 +525,8 @@ static void location_gnss_high_accuracy_get(void)
 		return;
 	}
 
+	gnss_progress_start("high_accuracy");
+
 	location_event_wait();
 }
 
@@ -501,11 +578,15 @@ static void location_gnss_periodic_get(void)
 		printk("Requesting location failed, error: %d\n", err);
 		return;
 	}
+
+	gnss_progress_start("periodic");
 }
 
 int main(void)
 {
 	int err;
+
+	k_work_init_delayable(&gnss_progress_work, gnss_progress_work_handler);
 
 	printk("Location sample started\n\n");
 
@@ -556,6 +637,11 @@ int main(void)
 		printk("[lte] waiting for LTE registration semaphore\n");
 		k_sem_take(&lte_connected, K_FOREVER);
 		printk("[lte] LTE registration semaphore received\n");
+	}
+
+	err = enable_onboard_gnss_antenna_if_needed();
+	if (err) {
+		return err;
 	}
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)

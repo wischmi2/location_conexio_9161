@@ -4,6 +4,8 @@
 
 # build
 /build*/
+.cache/
+*.log
 
 # local credentials - never commit
 credentials.conf
