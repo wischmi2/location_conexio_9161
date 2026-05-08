@@ -194,6 +194,21 @@ static void gnss_progress_work_handler(struct k_work *work)
 	printk("[gnss] waiting for fix... elapsed=%lld s\n", elapsed_s);
 	log_modem_snapshot("AT+CSCON?", "CSCON");
 	log_modem_snapshot("AT%XMONITOR", "XMONITOR");
+	
+	/* Add GNSS-specific diagnostics every 30s during wait */
+	if (elapsed_s % 90 == 0 && elapsed_s > 0) {
+		printk("[gnss] --- periodic GNSS status at %lld s ---\n", elapsed_s);
+		char rsp[256];
+		if (nrf_modem_at_cmd(rsp, sizeof(rsp), "AT%%XGNSS?") == 0) {
+			printk("[gnss] XGNSS: %s\n", rsp);
+		}
+		if (nrf_modem_at_cmd(rsp, sizeof(rsp), "AT%%XGPS?") == 0) {
+			printk("[gnss] XGPS: %s\n", rsp);
+		}
+		if (nrf_modem_at_cmd(rsp, sizeof(rsp), "AT+CIND?") == 0) {
+			printk("[gnss] signal: %s\n", rsp);
+		}
+	}
 
 	k_work_reschedule(&gnss_progress_work, K_SECONDS(30));
 }
@@ -338,11 +353,80 @@ static bool lte_is_registered(void)
 	       (status == LTE_LC_NW_REG_REGISTERED_ROAMING);
 }
 
+static void run_diag_at(const char *cmd, const char *tag)
+{
+	char rsp[256];
+	int err = nrf_modem_at_cmd(rsp, sizeof(rsp), "%s", cmd);
+
+	if (err == 0) {
+		printk("[gnss] %s: %s\n", tag, rsp);
+		return;
+	}
+
+	if (err == 0x10000) {
+		printk("[gnss] %s failed: modem returned ERROR (0x%x)\n", tag, err);
+	} else {
+		printk("[gnss] %s failed: err=%d (0x%x)\n", tag, err, err);
+	}
+}
+
+static void query_gnss_diagnostics(void)
+{
+	run_diag_at("AT+CGMI", "modem info");
+	run_diag_at("AT+CGMR", "modem firmware");
+	run_diag_at("AT+CIND?", "signal strength (CIND)");
+	run_diag_at("AT+CSQ", "signal quality (CSQ)");
+	run_diag_at("AT%XCOEX0?", "COEX config");
+	run_diag_at("AT%XMAGPIO?", "MAGPIO config");
+	run_diag_at("AT%XMIPIRFFEDEV?", "MIPIRFFEDEV config");
+}
+
 static int enable_onboard_gnss_antenna_if_needed(void)
 {
 #if defined(CONFIG_GPS_SAMPLE_ANTENNA_ONBOARD)
-	static const char coex0_cmd[] = "AT%XCOEX0=1,1,1565,1586";
-	int err = nrf_modem_at_printf("%s", coex0_cmd);
+	const char *magpio_cmd = CONFIG_GPS_SAMPLE_AT_MAGPIO;
+	const char *mipirffedev_cmd = CONFIG_GPS_SAMPLE_AT_MIPIRFFEDEV;
+	const char *mipirffectrl_init_cmd = CONFIG_GPS_SAMPLE_AT_MIPIRFFECTRL_INIT;
+	const char *mipirffectrl_on_cmd = CONFIG_GPS_SAMPLE_AT_MIPIRFFECTRL_ON;
+	const char *coex0_cmd = CONFIG_GPS_SAMPLE_AT_COEX0;
+	char rsp[192];
+	int qerr;
+	int err;
+
+	if (strlen(magpio_cmd) > 0) {
+		printk("[gnss] applying MAGPIO command: %s\n", magpio_cmd);
+		err = nrf_modem_at_printf("%s", magpio_cmd);
+		if (err) {
+			printk("[gnss] MAGPIO command failed (%d)\n", err);
+		}
+	}
+
+	if (strlen(mipirffedev_cmd) > 0) {
+		printk("[gnss] applying MIPIRFFEDEV command: %s\n", mipirffedev_cmd);
+		err = nrf_modem_at_printf("%s", mipirffedev_cmd);
+		if (err) {
+			printk("[gnss] MIPIRFFEDEV command failed (%d)\n", err);
+		}
+	}
+
+	if (strlen(mipirffectrl_init_cmd) > 0) {
+		printk("[gnss] applying MIPIRFFECTRL INIT command: %s\n", mipirffectrl_init_cmd);
+		err = nrf_modem_at_printf("%s", mipirffectrl_init_cmd);
+		if (err) {
+			printk("[gnss] MIPIRFFECTRL INIT command failed (%d)\n", err);
+		}
+	}
+
+	if (strlen(mipirffectrl_on_cmd) > 0) {
+		printk("[gnss] applying MIPIRFFECTRL ON command: %s\n", mipirffectrl_on_cmd);
+		err = nrf_modem_at_printf("%s", mipirffectrl_on_cmd);
+		if (err) {
+			printk("[gnss] MIPIRFFECTRL ON command failed (%d)\n", err);
+		}
+	}
+
+	printk("[gnss] applying COEX command: %s\n", coex0_cmd);
+	err = nrf_modem_at_printf("%s", coex0_cmd);
 
 	if (err) {
 		printk("[gnss] failed to enable onboard antenna with '%s': %d\n",
@@ -352,6 +436,18 @@ static int enable_onboard_gnss_antenna_if_needed(void)
 
 	printk("[gnss] onboard antenna enabled using '%s'\n",
 	       coex0_cmd);
+
+	qerr = nrf_modem_at_cmd(rsp, sizeof(rsp), "AT%%XCOEX0?");
+	if (qerr) {
+		printk("[gnss] COEX query failed (%d)\n", qerr);
+	} else {
+		printk("[gnss] COEX query result: %s\n", rsp);
+	}
+	
+	/* Query GNSS diagnostics after COEX configuration */
+	printk("[gnss] === GNSS Diagnostics ===\n");
+	query_gnss_diagnostics();
+	printk("[gnss] === End Diagnostics ===\n");
 #endif
 
 	return 0;
@@ -614,6 +710,8 @@ int main(void)
 	lte_lc_register_handler(lte_event_handler);
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	const bool golioth_traffic_enabled = false;
+
 	/*
 	 * nRF91 offloaded DTLS uses modem sec tags. Provision the PSK credentials
 	 * before LTE activation so the secure tag is ready for the DTLS session.
@@ -645,35 +743,39 @@ int main(void)
 	}
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
-	printk("[net] waiting for usable network\n");
-	err = wait_for_network_ready();
-	if (err) {
-		printk("Network did not become ready, error: %d\n", err);
-		return err;
-	}
+	if (golioth_traffic_enabled) {
+		printk("[net] waiting for usable network\n");
+		err = wait_for_network_ready();
+		if (err) {
+			printk("Network did not become ready, error: %d\n", err);
+			return err;
+		}
 
-	printk("[golioth] creating client after LTE/network readiness\n");
-	golioth_client = golioth_client_create(&golioth_cfg);
-	if (!golioth_client) {
-		printk("[golioth] client create returned NULL\n");
-		return -ENOMEM;
-	}
-	printk("[golioth] client created: %p\n", golioth_client);
+		printk("[golioth] creating client after LTE/network readiness\n");
+		golioth_client = golioth_client_create(&golioth_cfg);
+		if (!golioth_client) {
+			printk("[golioth] client create returned NULL\n");
+			return -ENOMEM;
+		}
+		printk("[golioth] client created: %p\n", golioth_client);
 
-	printk("Connecting to Golioth...\n");
-	printk("[golioth] using sec tag %d\n",
-	       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+		printk("Connecting to Golioth...\n");
+		printk("[golioth] using sec tag %d\n",
+		       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
 
-	golioth_client_register_event_callback(golioth_client, golioth_on_client_event, NULL);
-	printk("[golioth] waiting up to 60 seconds for connection\n");
+		golioth_client_register_event_callback(golioth_client, golioth_on_client_event, NULL);
+		printk("[golioth] waiting up to 60 seconds for connection\n");
 
-	int golioth_ret = k_sem_take(&golioth_connected_sem, K_SECONDS(60));
-	printk("[golioth] connection wait returned: %d\n", golioth_ret);
+		int golioth_ret = k_sem_take(&golioth_connected_sem, K_SECONDS(60));
+		printk("[golioth] connection wait returned: %d\n", golioth_ret);
 
-	if (golioth_ret == -EAGAIN) {
-		printk("Timed out waiting for Golioth connection, continuing anyway\n");
+		if (golioth_ret == -EAGAIN) {
+			printk("Timed out waiting for Golioth connection, continuing anyway\n");
+		} else {
+			publish_status_to_golioth("golioth_connected", 0);
+		}
 	} else {
-		publish_status_to_golioth("golioth_connected", 0);
+		printk("[golioth] traffic disabled for GNSS isolation test\n");
 	}
 #endif /* CONFIG_GOLIOTH_FIRMWARE_SDK */
 
