@@ -167,3 +167,105 @@ These do not block builds but should be treated as production hardening items.
 - Add a fixed pm_static.yml partition map for upgrade-safe releases.
 - Remove or replace deprecated Kconfig symbols where possible.
 - Perform on-device runtime verification of LTE attach, DNS, Golioth connect, and stream upload.
+
+## 10. Latest build recovery updates (May 8, 2026)
+
+This section captures the full set of changes needed to get this repository building on the Stratus 9160 path in this environment.
+
+### 10.1 Board migration to nRF9160 (from nRF9161)
+
+The active custom board root was migrated to 9160 naming and symbols:
+
+- Updated:
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/board.yml`
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/board.cmake`
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/Kconfig.conexio_stratus_pro`
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/Kconfig.defconfig`
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_partition_conf.dtsi`
+- Renamed/created board files for 9160:
+  - `conexio_stratus_pro_nrf9160.dts`
+  - `conexio_stratus_pro_nrf9160_ns.dts`
+  - `conexio_stratus_pro_nrf9160_defconfig`
+  - `conexio_stratus_pro_nrf9160_ns_defconfig`
+- Removed old `nrf9161` board file variants from the v3 board folder.
+
+### 10.2 Repository cleanup requested
+
+Per cleanup request, removed:
+
+- all current build directories at the time
+- `conexio_board_root`
+- `conexio_stratus_pro_devicetree`
+
+This left `conexio_board_root_v3` as the active custom board source.
+
+### 10.3 Build environment diagnosis
+
+Builds initially failed with many "undefined symbol" errors in `prj.conf` while using a non-matching SDK/workspace context.
+
+Root cause findings:
+
+- The command in this repo referenced `C:/ncs/v3.2.0/...`.
+- Local machine has `C:/ncs/v3.2.3`, not `v3.2.0`.
+- `golioth-firmware-sdk` was missing from `C:/ncs/v3.2.3/modules/lib`.
+
+### 10.4 Golioth module installation in NCS v3.2.3
+
+Installed missing module:
+
+- cloned `https://github.com/golioth/golioth-firmware-sdk.git` to
+  - `C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk`
+- verified module metadata exists:
+  - `C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk/zephyr/module.yml`
+
+### 10.5 Config symbol compatibility fixes for current NCS
+
+`NPM13XX_CHARGER` is not a valid symbol in this build path and caused hard Kconfig failures.
+
+Actions taken:
+
+- Removed/updated charger symbol usage in:
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_nrf9160_defconfig`
+  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_nrf9160_ns_defconfig`
+  - `sysbuild/mcuboot.conf`
+
+### 10.6 Sysbuild/mcuboot board qualification fix
+
+A TF-M target mismatch appeared when MCUboot was being built using the non-secure board qualifier.
+
+Fix:
+
+- Explicitly set MCUboot image board to secure qualifier via build arg:
+  - `-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160`
+
+### 10.7 Windows path translation failure and final fix
+
+After configuration passed, build failed at Ninja stage with:
+
+- missing dependency path in POSIX style:
+  - `/c/ncs/v3.2.3/nrf/.git`
+
+On this Windows setup, that path did not resolve during the build step, even though `C:\ncs\v3.2.3\nrf\.git` existed.
+
+Fix applied:
+
+- created junction:
+  - `C:\c -> C:\`
+
+This made `/c/...` paths resolvable for the generated dependency chain and unblocked the build.
+
+### 10.8 Final working build command (validated)
+
+Run from NCS 3.2.3 workspace context:
+
+```powershell
+west build --sysbuild -p always -d C:/Users/Brian/location_conexio_9161/build -b conexio_stratus_pro/nrf9160/ns C:/Users/Brian/location_conexio_9161 -- "-DBOARD_ROOT=C:/Users/Brian/location_conexio_9161/conexio_board_root_v3" "-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160" "-DZEPHYR_EXTRA_MODULES=C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk" "-DEXTRA_CONF_FILE=overlay-golioth.conf"
+```
+
+### 10.9 Final successful build indicators
+
+Successful run produced:
+
+- full compile/link completion for app and MCUboot
+- `dfu_application.zip`
+- `merged.hex`
