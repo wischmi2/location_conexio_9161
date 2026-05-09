@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
+#include <ctype.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/sys/util.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
 #include <modem/location.h>
@@ -18,15 +20,107 @@
 #include <date_time.h>
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+#include <mbedtls/ssl.h>
+#include <zephyr/net/tls_credentials.h>
 #include <golioth/client.h>
 #include <golioth/stream.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/net_event.h>
 #include <zephyr/net/socket.h>
 #include <zcbor_encode.h>
 
 #define GOLIOTH_PSK_ID CONFIG_GOLIOTH_SAMPLE_PSK_ID
 #define GOLIOTH_PSK    CONFIG_GOLIOTH_SAMPLE_PSK
+
+/* Golioth console often shows the PSK as a hex string (e.g. 64 nibbles = 32 bytes). mbedTLS
+ * needs the raw key bytes — passing ASCII hex fails mbedtls_ssl_conf_psk() (connect EINVAL).
+ */
+static bool golioth_psk_string_is_hex(const char *s, size_t len)
+{
+	if (len < 2U || (len % 2U) != 0U) {
+		return false;
+	}
+
+	for (size_t i = 0; i < len; i++) {
+		if (!isxdigit((unsigned char)s[i])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int golioth_psk_hex_decode(const char *hex, size_t hex_len, uint8_t *out, size_t out_cap,
+				  size_t *out_len)
+{
+	if ((hex_len % 2U) != 0U || hex_len / 2U > out_cap) {
+		return -EINVAL;
+	}
+
+	for (size_t i = 0; i < hex_len / 2U; i++) {
+		char h = hex[i * 2];
+		char l = hex[i * 2 + 1];
+		uint8_t vh;
+		uint8_t vl;
+
+		if (h >= '0' && h <= '9') {
+			vh = (uint8_t)(h - '0');
+		} else if (h >= 'a' && h <= 'f') {
+			vh = (uint8_t)(10 + (h - 'a'));
+		} else if (h >= 'A' && h <= 'F') {
+			vh = (uint8_t)(10 + (h - 'A'));
+		} else {
+			return -EINVAL;
+		}
+
+		if (l >= '0' && l <= '9') {
+			vl = (uint8_t)(l - '0');
+		} else if (l >= 'a' && l <= 'f') {
+			vl = (uint8_t)(10 + (l - 'a'));
+		} else if (l >= 'A' && l <= 'F') {
+			vl = (uint8_t)(10 + (l - 'A'));
+		} else {
+			return -EINVAL;
+		}
+
+		out[i] = (uint8_t)((vh << 4) | vl);
+	}
+
+	*out_len = hex_len / 2U;
+	return 0;
+}
+
+static void golioth_mbedtls_psk_selftest(const void *psk_raw, size_t psk_raw_len, const char *psk_id,
+					 size_t psk_id_len)
+{
+	mbedtls_ssl_config conf;
+	int ret;
+
+	mbedtls_ssl_config_init(&conf);
+
+	ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+					  MBEDTLS_SSL_TRANSPORT_DATAGRAM,
+					  MBEDTLS_SSL_PRESET_DEFAULT);
+	if (ret != 0) {
+		printk("[golioth] mbed selftest: ssl_config_defaults rc=%d (-0x%04x)\n", ret,
+		       (unsigned int)(ret < 0 ? -ret : 0));
+		goto done;
+	}
+
+	ret = mbedtls_ssl_conf_psk(&conf, (const unsigned char *)psk_raw, psk_raw_len,
+				   (const unsigned char *)psk_id, psk_id_len);
+	if (ret != 0) {
+		printk("[golioth] mbed selftest: ssl_conf_psk rc=%d (-0x%04x)\n", ret,
+		       (unsigned int)(ret < 0 ? -ret : 0));
+	} else {
+		printk("[golioth] mbed selftest: ssl_conf_psk OK (use this to distinguish "
+		       "mbedTLS vs socket layer)\n");
+	}
+
+done:
+	mbedtls_ssl_config_free(&conf);
+}
 
 static struct golioth_client *golioth_client;
 static K_SEM_DEFINE(golioth_connected_sem, 0, 1);
@@ -40,45 +134,72 @@ static const struct golioth_client_config golioth_cfg = {
 
 static int golioth_provision_psk_credentials(void)
 {
-	char psk_hex[(sizeof(GOLIOTH_PSK) - 1) * 2 + 1];
-	const char hex_digits[] = "0123456789abcdef";
+	const char *psk_id = GOLIOTH_PSK_ID;
 	const char *psk = GOLIOTH_PSK;
+	const size_t psk_id_len = strlen(psk_id);
+	const size_t psk_ascii_len = strlen(psk);
+	sec_tag_t tag = (sec_tag_t)CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG;
+	uint8_t psk_bin[128];
+	const void *psk_material = psk;
+	size_t psk_len = psk_ascii_len;
 	int err;
 
-	for (size_t i = 0; i < sizeof(GOLIOTH_PSK) - 1; i++) {
-		unsigned char value = (unsigned char)psk[i];
-
-		psk_hex[i * 2] = hex_digits[value >> 4];
-		psk_hex[i * 2 + 1] = hex_digits[value & 0x0f];
+	if (psk_id_len == 0 || psk_ascii_len == 0) {
+		printk("[golioth] missing credentials: set CONFIG_GOLIOTH_SAMPLE_PSK_ID and "
+		       "CONFIG_GOLIOTH_SAMPLE_PSK (e.g. west build ... "
+		       "-DEXTRA_CONF_FILE=credentials.conf)\n");
+		return -EINVAL;
 	}
-	psk_hex[sizeof(psk_hex) - 1] = '\0';
 
-	/* Ignore delete failures when the credentials do not exist yet. */
-	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,4",
-				 CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
-	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,3",
-				 CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+	/* Golioth normally shows the secret as 64 or 128 hex nibbles; only those lengths are
+	 * decoded so a 32-char alphanumeric passphrase is not reinterpreted as hex.
+	 */
+	if ((psk_ascii_len == 64U || psk_ascii_len == 128U) &&
+	    golioth_psk_string_is_hex(psk, psk_ascii_len)) {
+		err = golioth_psk_hex_decode(psk, psk_ascii_len, psk_bin, sizeof(psk_bin),
+					   &psk_len);
+		if (err) {
+			printk("[golioth] PSK hex decode failed (check length / MBEDTLS_PSK_MAX_LEN)\n");
+			return err;
+		}
 
-	err = nrf_modem_at_printf("AT%%CMNG=0,%d,4,\"%s\"",
-				  CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG,
-				  GOLIOTH_PSK_ID);
+		psk_material = psk_bin;
+		printk("[dbg] golioth PSK: hex string %zu chars -> %zu raw bytes\n", psk_ascii_len,
+		       psk_len);
+	}
+
+	printk("[dbg] golioth PSK provision: sec_tag=%u psk_id_len=%zu psk_len=%zu\n",
+	       (unsigned int)tag, psk_id_len, psk_len);
+
+	/*
+	 * Native mbedTLS DTLS uses Zephyr tls_credential_* (volatile backend). Modem-only
+	 * storage does not expose PSK entries to mbedtls (ENOENT during handshake).
+	 */
+	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK_ID);
+	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK);
+
+	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK_ID, psk_id, psk_id_len);
 	if (err) {
-		printk("[golioth] failed to provision PSK ID to sec tag %d: %d\n",
-		       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG, err);
+		printk("[golioth] tls_credential_add PSK_ID failed for tag %u: %d\n",
+		       (unsigned int)tag, err);
 		return err;
 	}
 
-	err = nrf_modem_at_printf("AT%%CMNG=0,%d,3,\"%s\"",
-				  CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG,
-				  psk_hex);
+	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK, psk_material, psk_len);
 	if (err) {
-		printk("[golioth] failed to provision PSK to sec tag %d: %d\n",
-		       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG, err);
+		printk("[golioth] tls_credential_add PSK failed for tag %u: %d\n",
+		       (unsigned int)tag, err);
 		return err;
 	}
 
-	printk("[golioth] provisioned PSK credentials to sec tag %d\n",
-	       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
+	printk("[golioth] provisioned PSK credentials (volatile) for sec tag %u\n",
+	       (unsigned int)tag);
+
+	/*
+	 * Zephyr maps mbedTLS setup failures to connect() EINVAL (-22). Call mbedTLS
+	 * directly once so the console shows the real mbed error code (e.g. -0x7100).
+	 */
+	golioth_mbedtls_psk_selftest(psk_material, psk_len, psk_id, psk_id_len);
 
 	return 0;
 }
@@ -159,6 +280,85 @@ static void publish_status_to_golioth(const char *state, int32_t code)
 		printk("[golioth] status published to path 'loc/stat': %s (%d)\n", state, code);
 	}
 }
+
+/* Latest fix for bundling with periodic sensor telemetry on LightDB Stream. */
+static K_MUTEX_DEFINE(golioth_last_loc_mtx);
+static struct {
+	double lat;
+	double lon;
+	double acc_m;
+	char method[24];
+	bool valid;
+} golioth_last_loc;
+
+static void golioth_store_last_location(const struct location_event_data *ev)
+{
+	k_mutex_lock(&golioth_last_loc_mtx, K_FOREVER);
+	golioth_last_loc.lat = ev->location.latitude;
+	golioth_last_loc.lon = ev->location.longitude;
+	golioth_last_loc.acc_m = (double)ev->location.accuracy;
+	{
+		const char *m = location_method_str(ev->method);
+
+		strncpy(golioth_last_loc.method, m, sizeof(golioth_last_loc.method) - 1);
+		golioth_last_loc.method[sizeof(golioth_last_loc.method) - 1] = '\0';
+	}
+	golioth_last_loc.valid = true;
+	k_mutex_unlock(&golioth_last_loc_mtx);
+}
+
+/*
+ * Periodic JSON to path telemetry/snapshot: env + accelerometer + last known location.
+ * Stream paths are hierarchical; Golioth LightDB Stream shows telemetry/snapshot.
+ */
+static void golioth_publish_telemetry_snapshot(double temp_c, double rh_pct, bool have_env,
+					       double ax, double ay, double az, bool have_motion)
+{
+	char payload[512];
+	int len;
+	bool have_loc;
+	double lat, lon, acc_m;
+	char method[24];
+
+	if (!golioth_client || !golioth_client_is_connected(golioth_client)) {
+		return;
+	}
+
+	k_mutex_lock(&golioth_last_loc_mtx, K_FOREVER);
+	have_loc = golioth_last_loc.valid;
+	lat = golioth_last_loc.lat;
+	lon = golioth_last_loc.lon;
+	acc_m = golioth_last_loc.acc_m;
+	strncpy(method, golioth_last_loc.method, sizeof(method) - 1);
+	method[sizeof(method) - 1] = '\0';
+	k_mutex_unlock(&golioth_last_loc_mtx);
+
+	len = snprintk(payload, sizeof(payload),
+		       "{\"uptime_ms\":%lld,"
+		       "\"env_ok\":%d,\"temp_c\":%.2f,\"rh_pct\":%.1f,"
+		       "\"motion_ok\":%d,\"ax_ms2\":%.5f,\"ay_ms2\":%.5f,\"az_ms2\":%.5f,"
+		       "\"loc_ok\":%d,\"lat\":%.7f,\"lon\":%.7f,\"loc_acc_m\":%.1f,"
+		       "\"loc_method\":\"%s\"}",
+		       k_uptime_get(),
+		       have_env ? 1 : 0, temp_c, rh_pct,
+		       have_motion ? 1 : 0, ax, ay, az,
+		       have_loc ? 1 : 0, lat, lon, acc_m, method);
+
+	if (len <= 0 || len >= (int)sizeof(payload)) {
+		printk("[golioth] telemetry JSON encode failed or truncated (len=%d)\n", len);
+		return;
+	}
+
+	enum golioth_status status = golioth_stream_set(golioth_client,
+							"telemetry/snapshot",
+							GOLIOTH_CONTENT_TYPE_JSON,
+							payload, (size_t)len,
+							NULL, NULL);
+
+	if (status != GOLIOTH_OK) {
+		printk("[golioth] telemetry/snapshot publish failed: %d\n", status);
+	}
+}
 #endif /* CONFIG_GOLIOTH_FIRMWARE_SDK */
 
 static K_SEM_DEFINE(location_event, 0, 1);
@@ -174,8 +374,6 @@ static struct k_work_delayable boot_heartbeat_work;
 static bool modem_ready_for_debug;
 static const char *boot_stage = "reset";
 static struct k_work_delayable boot_led_work;
-static bool boot_lte_registered;
-static bool boot_led_state;
 
 #if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
 static const struct device *const sht40_dev = DEVICE_DT_GET(DT_ALIAS(sht40));
@@ -192,6 +390,14 @@ static void sensor_poll_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
+	bool have_env = false;
+	double temp_c = 0.0;
+	double rh_pct = 0.0;
+	bool have_motion = false;
+	double ax_ms2 = 0.0;
+	double ay_ms2 = 0.0;
+	double az_ms2 = 0.0;
+
 #if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
 	if (device_is_ready(sht40_dev)) {
 		struct sensor_value t, rh;
@@ -207,9 +413,10 @@ static void sensor_poll_work_handler(struct k_work *work)
 			if (err) {
 				printk("[sensor] SHT40 channel read failed: %d\n", err);
 			} else {
-				printk("[sensor] SHT40: %.2f degC, %.1f %%RH\n",
-				       sensor_value_to_double(&t),
-				       sensor_value_to_double(&rh));
+				temp_c = sensor_value_to_double(&t);
+				rh_pct = sensor_value_to_double(&rh);
+				have_env = true;
+				printk("[sensor] SHT40: %.2f degC, %.1f %%RH\n", temp_c, rh_pct);
 			}
 		}
 	} else {
@@ -229,10 +436,12 @@ static void sensor_poll_work_handler(struct k_work *work)
 			if (err) {
 				printk("[sensor] LIS2DH channel read failed: %d\n", err);
 			} else {
+				ax_ms2 = sensor_value_to_double(&acc[0]);
+				ay_ms2 = sensor_value_to_double(&acc[1]);
+				az_ms2 = sensor_value_to_double(&acc[2]);
+				have_motion = true;
 				printk("[sensor] LIS2DH (m/s^2): X=%.3f Y=%.3f Z=%.3f\n",
-				       sensor_value_to_double(&acc[0]),
-				       sensor_value_to_double(&acc[1]),
-				       sensor_value_to_double(&acc[2]));
+				       ax_ms2, ay_ms2, az_ms2);
 			}
 		}
 	} else {
@@ -240,23 +449,157 @@ static void sensor_poll_work_handler(struct k_work *work)
 	}
 #endif
 
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	golioth_publish_telemetry_snapshot(temp_c, rh_pct, have_env, ax_ms2, ay_ms2, az_ms2,
+					   have_motion);
+#endif
+
 	k_work_reschedule(&sensor_poll_work, K_SECONDS(10));
 }
 #endif
+
+static uint8_t boot_stage_lookup_led_blinks(const char *stage)
+{
+	static const struct {
+		const char *name;
+		uint8_t blinks;
+	} map[] = {
+		{ "main_entry", 1 },
+		{ "date_time_handler_register", 2 },
+		{ "nrf_modem_lib_init_begin", 3 },
+		{ "nrf_modem_lib_init_done", 4 },
+		{ "lte_handler_register", 5 },
+		{ "golioth_psk_provision", 6 },
+		{ "lte_connect_request", 7 },
+		{ "lte_wait_registered", 8 },
+		{ "lte_registered", 9 },
+		{ "gnss_antenna_enable", 10 },
+		{ "network_wait_ready", 11 },
+		{ "golioth_client_create", 12 },
+		{ "golioth_wait_connected", 13 },
+		{ "date_time_wait", 14 },
+		{ "location_init", 15 },
+		{ "location_high_accuracy_start", 16 },
+		{ "location_periodic_running", 17 },
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
+		if (!strcmp(stage, map[i].name)) {
+			return map[i].blinks;
+		}
+	}
+
+	return 1;
+}
 
 #define BOOT_LED_NODE DT_ALIAS(led0)
 #if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
 static const struct gpio_dt_spec boot_led = GPIO_DT_SPEC_GET(BOOT_LED_NODE, gpios);
 static bool boot_led_ready;
+
+#define BOOT_LED_ON_MS           160
+#define BOOT_LED_BETWEEN_MS      220
+#define BOOT_LED_GROUP_GAP_MS    1500
+#define BOOT_LED_FIRST_GAP_MS    450
+#define BOOT_LED_STAGECHG_GAP_MS 280
+
+enum boot_led_phase {
+	BOOT_LED_PHASE_GAP = 0,
+	BOOT_LED_PHASE_ON,
+	BOOT_LED_PHASE_OFF,
+};
+
+static uint8_t boot_led_pattern_blinks = 1;
+static enum boot_led_phase boot_led_phase = BOOT_LED_PHASE_GAP;
+static uint8_t boot_led_flash_idx;
+
+static void boot_led_enter_gap(uint16_t gap_ms);
+
+static void boot_led_notify_stage_changed(void)
+{
+	if (!boot_led_ready) {
+		return;
+	}
+
+	boot_led_enter_gap(BOOT_LED_STAGECHG_GAP_MS);
+}
+
+static void boot_led_enter_gap(uint16_t gap_ms)
+{
+	boot_led_phase = BOOT_LED_PHASE_GAP;
+	boot_led_flash_idx = 0;
+
+	if (!boot_led_ready) {
+		return;
+	}
+
+	(void)gpio_pin_set_dt(&boot_led, 0);
+	k_work_reschedule(&boot_led_work, K_MSEC(gap_ms));
+}
+
+static void boot_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	uint8_t n = boot_led_pattern_blinks;
+
+	if (n > 24U) {
+		n = 24U;
+	}
+
+	if (!boot_led_ready) {
+		return;
+	}
+
+	switch (boot_led_phase) {
+	case BOOT_LED_PHASE_GAP:
+		boot_led_flash_idx = 0;
+		boot_led_phase = BOOT_LED_PHASE_ON;
+		k_work_reschedule(&boot_led_work, K_NO_WAIT);
+		break;
+
+	case BOOT_LED_PHASE_ON:
+		(void)gpio_pin_set_dt(&boot_led, 1);
+		boot_led_phase = BOOT_LED_PHASE_OFF;
+		k_work_reschedule(&boot_led_work, K_MSEC(BOOT_LED_ON_MS));
+		break;
+
+	case BOOT_LED_PHASE_OFF:
+		(void)gpio_pin_set_dt(&boot_led, 0);
+		boot_led_flash_idx++;
+
+		if (boot_led_flash_idx < n) {
+			boot_led_phase = BOOT_LED_PHASE_ON;
+			k_work_reschedule(&boot_led_work, K_MSEC(BOOT_LED_BETWEEN_MS));
+		} else {
+			boot_led_enter_gap(BOOT_LED_GROUP_GAP_MS);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+#else
+static void boot_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+}
 #endif
 
 static void boot_mark(const char *stage)
 {
+	unsigned int led_n = boot_stage_lookup_led_blinks(stage);
+
 	boot_stage = stage;
-	if (!strcmp(stage, "lte_registered")) {
-		boot_lte_registered = true;
-	}
-	printk("[boot] stage=%s uptime=%lld ms\n", boot_stage, k_uptime_get());
+
+	printk("[boot] stage=%s led_pattern=%u blink%s uptime=%lld ms\n", boot_stage, led_n,
+	       led_n == 1U ? "" : "s", k_uptime_get());
+
+#if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
+	boot_led_pattern_blinks = led_n > 24U ? 24U : (uint8_t)led_n;
+	boot_led_notify_stage_changed();
+#endif
 }
 
 static void log_modem_snapshot(const char *cmd, const char *tag)
@@ -270,6 +613,59 @@ static void log_modem_snapshot(const char *cmd, const char *tag)
 	}
 
 	printk("[gnss] %s: %s\n", tag, rsp);
+}
+
+static void log_modem_firmware_version(void)
+{
+	char rsp[192];
+	char *ver;
+	int err = nrf_modem_at_cmd(rsp, sizeof(rsp), "%s", "AT%SHORTSWVER");
+
+	if (err) {
+		printk("[dbg] modem firmware version (AT%%SHORTSWVER) failed: %d\n", err);
+		return;
+	}
+
+	/* rsp is typically "%SHORTSWVER: nrf9160_x.y.z\r\nOK\r\n" — emit one short line. */
+	ver = strstr(rsp, ": ");
+	if (ver) {
+		ver += 2;
+		for (char *q = ver; *q; q++) {
+			if (*q == '\r' || *q == '\n') {
+				*q = '\0';
+				break;
+			}
+		}
+		printk("[dbg] modem firmware version: %s\n", ver);
+	} else {
+		printk("[dbg] modem firmware version (raw): %s\n", rsp);
+	}
+}
+
+static void log_modem_hardware_version(void)
+{
+	char rsp[192];
+	char *ver;
+	int err = nrf_modem_at_cmd(rsp, sizeof(rsp), "%s", "AT%HWVERSION");
+
+	if (err) {
+		printk("[dbg] modem hardware version (AT%%HWVERSION) failed: %d\n", err);
+		return;
+	}
+
+	ver = strstr(rsp, ": ");
+	if (ver) {
+		ver += 2;
+		for (char *q = ver; *q; q++) {
+			if (*q == '\r' || *q == '\n') {
+				*q = '\0';
+				break;
+			}
+		}
+		printk("[dbg] modem hardware version: %s\n", ver);
+	} else {
+		printk("[dbg] modem hardware version (raw): %s\n", rsp);
+	}
 }
 
 static void gnss_progress_work_handler(struct k_work *work)
@@ -305,24 +701,6 @@ static void boot_heartbeat_work_handler(struct k_work *work)
 	k_work_reschedule(&boot_heartbeat_work, K_SECONDS(15));
 }
 
-static void boot_led_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-#if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
-	if (!boot_led_ready) {
-		return;
-	}
-
-	boot_led_state = !boot_led_state;
-	(void)gpio_pin_set_dt(&boot_led, (int)boot_led_state);
-
-	/* Faster blink during early boot; slower once registered on LTE. */
-	k_work_reschedule(&boot_led_work,
-			  boot_lte_registered ? K_MSEC(900) : K_MSEC(200));
-#endif
-}
-
 static void gnss_progress_start(const char *context)
 {
 	gnss_debug_active = true;
@@ -354,8 +732,10 @@ static int wait_for_golioth_dns(void)
 	int err;
 
 	printk("[net] resolving coap.golioth.io:5684\n");
+	printk("[dbg] wait_for_golioth_dns: start uptime=%lld ms\n", k_uptime_get());
 
 	for (int i = 0; i < 24; i++) {
+		printk("[dbg] DNS try %d/24 uptime=%lld ms\n", i + 1, k_uptime_get());
 		err = zsock_getaddrinfo("coap.golioth.io", "5684", &hints, &res);
 		if (!err) {
 			int sock = zsock_socket(res->ai_family, SOCK_DGRAM, IPPROTO_UDP);
@@ -389,6 +769,8 @@ static int wait_for_network_ready(void)
 	uint64_t raised_event;
 	int err;
 
+	printk("[dbg] wait_for_network_ready: enter uptime=%lld ms\n", k_uptime_get());
+
 	if (!iface) {
 		printk("[net] no default network interface\n");
 		return -ENODEV;
@@ -397,6 +779,7 @@ static int wait_for_network_ready(void)
 	printk("[net] default iface=%p dormant=%d\n", iface, net_if_is_dormant(iface));
 
 	err = net_if_up(iface);
+	printk("[dbg] net_if_up(iface) -> %d uptime=%lld ms\n", err, k_uptime_get());
 	if (err && err != -EALREADY) {
 		printk("[net] net_if_up failed: %d\n", err);
 		return err;
@@ -406,9 +789,12 @@ static int wait_for_network_ready(void)
 
 	if (net_if_is_dormant(iface)) {
 		printk("Waiting for LTE network interface...\n");
+		printk("[dbg] waiting L4 connected (up to 120s) uptime=%lld ms\n",
+		       k_uptime_get());
 		err = net_mgmt_event_wait_on_iface(iface, NET_EVENT_L4_CONNECTED,
 						   &raised_event, NULL, NULL,
 						   K_SECONDS(120));
+		printk("[dbg] L4 wait done err=%d uptime=%lld ms\n", err, k_uptime_get());
 		if (err) {
 			printk("[net] wait for L4 connected failed: %d\n", err);
 			return err;
@@ -418,6 +804,29 @@ static int wait_for_network_ready(void)
 	}
 
 	printk("LTE network interface ready\n");
+
+	/*
+	 * Wait until the modem has assigned an IPv4 address before DNS and Golioth DTLS.
+	 * Matches Golioth net_connect() pattern; avoids zsock_connect() failing during handshake.
+	 */
+	if (net_if_ipv4_get_global_addr(iface, NET_ADDR_PREFERRED) == NULL) {
+		printk("[net] waiting for IPv4 address (up to 120 s)...\n");
+		err = net_mgmt_event_wait_on_iface(iface, NET_EVENT_IPV4_ADDR_ADD,
+						   &raised_event, NULL, NULL,
+						   K_SECONDS(120));
+		printk("[dbg] IPv4 wait done err=%d uptime=%lld ms\n", err,
+		       k_uptime_get());
+		if (err) {
+			printk("[net] wait for IPv4 address failed: %d\n", err);
+			return err;
+		}
+		printk("[net] IPv4 assigned\n");
+	} else {
+		printk("[net] IPv4 already assigned\n");
+	}
+
+	printk("[dbg] wait_for_network_ready: calling DNS wait uptime=%lld ms\n",
+	       k_uptime_get());
 
 	return wait_for_golioth_dns();
 }
@@ -431,11 +840,16 @@ static void date_time_evt_handler(const struct date_time_evt *evt)
 
 static void lte_event_handler(const struct lte_lc_evt *const evt)
 {
+	printk("[dbg] lte_event_handler: type=%d uptime=%lld ms\n", evt->type,
+	       k_uptime_get());
+
 	switch (evt->type) {
 	case LTE_LC_EVT_NW_REG_STATUS:
 		printk("[lte] network registration status: %d\n", evt->nw_reg_status);
 		if ((evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME) ||
 		     (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING)) {
+			printk("[dbg] LTE registered home/roam -> give lte_connected uptime=%lld ms\n",
+			       k_uptime_get());
 			printk("Connected to LTE\n");
 			k_sem_give(&lte_connected);
 		}
@@ -509,6 +923,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		printk("  Google maps URL: https://maps.google.com/?q=%.06f,%.06f\n\n",
 			event_data->location.latitude, event_data->location.longitude);
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		golioth_store_last_location(event_data);
 		publish_status_to_golioth("location_fix", 0);
 		publish_location_to_golioth(event_data);
 #endif
@@ -726,8 +1141,8 @@ int main(void)
 	if (gpio_is_ready_dt(&boot_led)) {
 		if (!gpio_pin_configure_dt(&boot_led, GPIO_OUTPUT_INACTIVE)) {
 			boot_led_ready = true;
-			k_work_reschedule(&boot_led_work, K_NO_WAIT);
-			printk("[boot] LED debug blink enabled on led0\n");
+			boot_led_enter_gap(BOOT_LED_FIRST_GAP_MS);
+			printk("[boot] LED stage blink enabled on led0 (first gap then pattern)\n");
 		} else {
 			printk("[boot] failed to configure led0 for debug blink\n");
 		}
@@ -767,40 +1182,52 @@ int main(void)
 		printk("[lte] modem library initialized\n");
 	}
 	modem_ready_for_debug = true;
+	log_modem_firmware_version();
+	log_modem_hardware_version();
 	log_modem_snapshot("AT+CFUN?", "CFUN");
 	log_modem_snapshot("AT%XMODEMUUID", "MODEMUUID");
 
-	boot_mark("lte_handler_register");
-	printk("[lte] registering LTE event handler\n");
-	lte_lc_register_handler(lte_event_handler);
-
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	/* Register PSK in Zephyr TLS store before Golioth DTLS (after modem AT probe). */
 	boot_mark("golioth_psk_provision");
-	/*
-	 * nRF91 offloaded DTLS uses modem sec tags. Provision the PSK credentials
-	 * before LTE activation so the secure tag is ready for the DTLS session.
-	 */
 	err = golioth_provision_psk_credentials();
 	if (err) {
 		return err;
 	}
 #endif
 
+	boot_mark("lte_handler_register");
+	printk("[lte] registering LTE event handler\n");
+	lte_lc_register_handler(lte_event_handler);
+
 	if (!lte_is_registered()) {
 		boot_mark("lte_connect_request");
 		printk("[lte] requesting LTE connection\n");
+		printk("[dbg] lte_lc_connect() call uptime=%lld ms\n", k_uptime_get());
 		err = lte_lc_connect();
+		printk("[dbg] lte_lc_connect() returned %d uptime=%lld ms\n", err,
+		       k_uptime_get());
 		if (err) {
 			printk("LTE connection request failed, error: %d\n", err);
 			return err;
 		}
+	} else {
+		printk("[dbg] skip lte_lc_connect: already registered uptime=%lld ms\n",
+		       k_uptime_get());
 	}
 
 	if (!lte_is_registered()) {
 		boot_mark("lte_wait_registered");
 		printk("[lte] waiting for LTE registration semaphore\n");
+		printk("[dbg] k_sem_take(&lte_connected) blocking uptime=%lld ms\n",
+		       k_uptime_get());
 		k_sem_take(&lte_connected, K_FOREVER);
+		printk("[dbg] k_sem_take(&lte_connected) done uptime=%lld ms\n",
+		       k_uptime_get());
 		printk("[lte] LTE registration semaphore received\n");
+	} else {
+		printk("[dbg] skip lte wait: already registered uptime=%lld ms\n",
+		       k_uptime_get());
 	}
 	boot_mark("lte_registered");
 
@@ -835,8 +1262,12 @@ int main(void)
 
 	golioth_client_register_event_callback(golioth_client, golioth_on_client_event, NULL);
 	printk("[golioth] waiting up to 60 seconds for connection\n");
+	printk("[dbg] k_sem_take(golioth_connected) start uptime=%lld ms\n",
+	       k_uptime_get());
 
 	int golioth_ret = k_sem_take(&golioth_connected_sem, K_SECONDS(60));
+	printk("[dbg] k_sem_take(golioth_connected) ret=%d uptime=%lld ms\n", golioth_ret,
+	       k_uptime_get());
 	printk("[golioth] connection wait returned: %d\n", golioth_ret);
 
 	if (golioth_ret == -EAGAIN) {
@@ -850,9 +1281,13 @@ int main(void)
 	if (IS_ENABLED(CONFIG_DATE_TIME)) {
 		boot_mark("date_time_wait");
 		printk("Waiting for current time\n");
+		printk("[dbg] k_sem_take(time_update_finished) start uptime=%lld ms\n",
+		       k_uptime_get());
 
 		/* Wait for an event from the Date Time library. */
 		int time_ret = k_sem_take(&time_update_finished, K_MINUTES(10));
+		printk("[dbg] k_sem_take(time_update_finished) ret=%d uptime=%lld ms\n",
+		       time_ret, k_uptime_get());
 		printk("[time] wait returned: %d\n", time_ret);
 
 		if (!date_time_is_valid()) {

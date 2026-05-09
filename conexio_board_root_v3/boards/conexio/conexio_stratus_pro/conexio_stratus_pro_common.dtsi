@@ -135,9 +135,14 @@
 		repeatability = <1>;
 	};
 
-	/* LIS2DH12TR: use reg 0x19 if SA0/SDO is high */
+	/*
+	 * LIS2DH12 on I2C. Zephyr's driver uses DT_DRV_COMPAT "st,lis2dh", so the
+	 * node must include that compatible (see st,lis2dh-i2c binding). Keep
+	 * "st,lis2dh12" first so chip-specific behavior (e.g. temperature) is kept.
+	 * Use reg = <0x19> if SA0/SDO is tied high on the board.
+	 */
 	lis2dh12_ext: lis2dh12@18 {
-		compatible = "st,lis2dh12";
+		compatible = "st,lis2dh12", "st,lis2dh";
 		reg = <0x18>;
 		disconnect-sdo-sa0-pull-up;
 	};

@@ -1,271 +1,178 @@
-# Changes and Fixes Attempted So Far
-
-This summary is based on the current workspace files and captured build logs.
-
-## 1. Planning and integration setup
-
-- Added a full integration plan in GOLIOTH_LOCATION_INTEGRATION_PLAN.md.
-- Captured target architecture, phases, build commands, and verification criteria.
-- Recorded Golioth project/device credential context and intended stream path for location data.
-
-## 2. New Golioth overlay and configuration hardening
-
-A new overlay file was added: overlay-golioth.conf.
-
-Key changes attempted in this overlay:
+# Changes and fixes — Golioth DTLS debugging (nRF9160 / Conexio Stratus Pro)
 
-- Enabled Golioth Firmware SDK and streaming:
-  - CONFIG_GOLIOTH_FIRMWARE_SDK=y
-  - CONFIG_GOLIOTH_STREAM=y
-  - CONFIG_GOLIOTH_AUTH_METHOD_PSK=y
-  - CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG=42
-- Forced modem networking path for nRF91 offloaded sockets:
-  - CONFIG_NRF_MODEM_LIB_NET_IF=y
-  - CONFIG_NRF_MODEM_LIB_NET_IF_AUTO_START=y
-  - CONFIG_NET_CONNECTION_MANAGER=y
-- Forced IPv4-only LTE/network path to address observed modem/network behavior:
-  - CONFIG_LTE_LC_PDN_DEFAULTS_OVERRIDE=y
-  - CONFIG_LTE_LC_PDN_DEFAULT_FAM_IPV4=y
-  - CONFIG_NET_IPV4=y
-  - CONFIG_NET_IPV6=n
-- Added extra diagnostics for Golioth and network stack:
-  - CONFIG_GOLIOTH_LOG_LEVEL_DBG=y
-  - CONFIG_NET_LOG=y
-  - CONFIG_NET_SOCKETS_LOG_LEVEL_DBG=y
-- Enabled eventfd support required by Golioth internals:
-  - CONFIG_ZVFS=y
-  - CONFIG_ZVFS_EVENTFD=y
-- Adjusted TLS feature mix to avoid invalid DTLS option combinations reported in comments:
-  - Disabled DHE key exchange variants
-  - Disabled EC extended parsing
-  - Disabled Nordic security backend in this overlay
-  - Kept MBEDTLS legacy crypto compatibility enabled
-- Increased runtime memory sizes:
-  - CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=2048
-  - CONFIG_HEAP_MEM_POOL_SIZE=16384
-  - CONFIG_MAIN_STACK_SIZE=4096
+This document lists configuration and code changes made while debugging **LTE → DNS → Golioth DTLS** on **nRF Connect SDK v3.2.x**, **Zephyr 4.2.x**, **Golioth Firmware SDK v0.22.x**, board **`conexio_stratus_pro/nrf9160/ns`**.
 
-## 3. Application code changes in src/main.c
+---
 
-Golioth integration code was added behind CONFIG_GOLIOTH_FIRMWARE_SDK guards.
+## 1. Symptoms observed on the serial console
 
-Main code-level fixes attempted:
+| Observation | Notes |
+|---------------|--------|
+| `modem_key_mgmt` / sec-tag write failures while LTE active | Nordic modem rejects credential writes when data call is already up. |
+| `Failed to connect to socket: -109` (`ENOTSUP`) | Modem-offloaded TLS path does not support some `setsockopt` operations Golioth’s Zephyr port uses for DTLS. |
+| `Failed to connect` / handshake with errno **2** (`ENOENT`) | PSK not visible to **native** mbedTLS via Zephyr’s credential lookup (modem TLS backend does not register PSK types for `credential_next_get`). |
+| `connect()` **-22** (`EINVAL`) | Misconfiguration during TLS setup (PSK length, cipher options, or Golioth DTLS handshake timeout overrides interacting with half-initialized mbedTLS config). |
+| `Failed to connect to socket: -12` (`ENOMEM`) | mbedTLS heap and/or system heap too small during DTLS handshake; Zephyr maps allocation failures to `-12`. |
+| `TLS handshake error: -0x7780` | **`MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE`** (mbedTLS `ssl.h`): the **Golioth server sent a TLS fatal alert** — wrong PSK/identity, cipher mismatch, or other handshake rejection (not a RAM failure). |
+| `Failed to connect to socket: -113` | **`ECONNABORTED` (113)** in Zephyr errno — `sockets_tls.c` maps non-recoverable mbedTLS handshake failures (including fatal-alert errors) to **`ECONNABORTED`** after reset; same underlying issue as `-0x7780`, not a separate transport bug. |
+| `Registration rejected, EMM cause: 11` | Network/SIM/plan issue; registration later succeeded in traces — separate from Golioth socket errors. |
+| `nrf_modem_lib_netif: MTU query failed` | Warning seen around iface bring-up; DNS and UDP probes still succeeded afterward. |
 
-- Added Golioth headers and client globals.
-- Added event callback and connection semaphore handling.
-- Added CBOR encoding of location payload (lat/lon/acc) and publish via golioth_stream_set.
-- Hooked publish logic into LOCATION_EVT_LOCATION so each successful fix is sent.
-- Added network readiness checks before client creation:
-  - net_if_up and L4 connected event wait
-  - DNS retry loop for coap.golioth.io:5684
-  - Raw UDP connect probe logging
-- Added extensive debug logging for LTE state, DNS readiness, client creation, and publish status.
+---
 
-## 4. Sysbuild and MCUboot related changes
+## 2. `overlay-golioth.conf` — Golioth, modem net IF, TLS, heaps
 
-- Added sysbuild.conf with:
-  - SB_CONFIG_BOOTLOADER_MCUBOOT=y
-- Added sysbuild/mcuboot.conf with conservative MCUboot options:
-  - Manual image sector settings
-  - Removal/avoidance of invalid or conflicting symbols
-  - Disabled unused peripheral features for bootloader footprint simplification
+Applied with **`-DEXTRA_CONF_FILE=overlay-golioth.conf`** (often combined with `credentials.conf`).
 
-## 5. Build attempts and outcomes from logs
+**Golioth**
 
-### Earlier failed attempt (build.log)
+- `CONFIG_GOLIOTH_FIRMWARE_SDK=y`, `CONFIG_GOLIOTH_STREAM=y`, `CONFIG_GOLIOTH_AUTH_METHOD_PSK=y`
+- `CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG=42` — fixed sec tag for PSK/TLS auth.
 
-Observed failure:
+**Modem network interface / boot order**
 
-- Trusted Firmware-M compile failed with:
-  - fatal error: pm_config.h: No such file or directory
-- Failure occurred while compiling TF-M platform source (spu.c), and build stopped.
+- `CONFIG_NRF_MODEM_LIB_NET_IF=y`, `CONFIG_NRF_MODEM_LIB_NET_IF_AUTO_START=y`
+- **`CONFIG_NRF_MODEM_LIB_NET_IF_AUTO_CONNECT=n`** — prevents LTE from attaching before the application can provision credentials (avoids “not allowed when LTE connection is active” for `modem_key_mgmt`).
+- `CONFIG_MODEM_KEY_MGMT=y`, `CONFIG_NET_CONNECTION_MANAGER=y`, `CONFIG_NET_CONNECTION_MANAGER_MONITOR_STACK_SIZE=1024`
 
-### Later successful attempts
+**PSK visible to native mbedTLS**
 
-build_stratus.log tail indicates successful completion:
+- **`CONFIG_TLS_CREDENTIALS_BACKEND_VOLATILE=y`** — use Zephyr’s volatile credential store so `tls_credential_add(PSK_ID/PSK)` is visible to native mbedTLS (fixes **ENOENT** when not using modem TLS backend for PSK).
 
-- Final link completed for zephyr.elf
-- Memory usage summary printed
-- "Completed 'location'"
-- merged.hex generated
+**LTE / IP stack**
 
-build_stratus_mcuboot.log tail indicates successful MCUboot/sysbuild completion:
+- IPv4-only PDN (observed ESM / dual-stack issues): `CONFIG_LTE_LC_PDN_DEFAULTS_OVERRIDE=y`, `CONFIG_LTE_LC_PDN_DEFAULT_FAM_IPV4=y`
+- **`CONFIG_NET_IPV6=y`** with neighbor discovery/MLD off (`CONFIG_NET_IPV6_NBR_CACHE=n`, `CONFIG_NET_IPV6_MLD=n`) — “hello_nrf91_offloaded” style so **`getaddrinfo` / DTLS** are not broken by fully disabling the IPv6 node; still IPv4 data path.
 
-- Final link completed for zephyr.elf
-- Image signing steps ran
-- dfu_application.zip generated
-- merged.hex generated
+**Force native TLS over modem offload**
 
-## 6. Warnings and non-fatal issues still seen
+- **`CONFIG_NET_SOCKETS_TLS_PRIORITY=35`** — Zephyr native mbedTLS DTLS wins over modem-offloaded TLS, avoiding **ENOTSUP (-109)** on DTLS `setsockopt` paths.
 
-Across logs, warnings still appear, including:
+**Logging**
 
-- Deprecated symbol warnings:
-  - NRF_CLOUD_REST
-  - MBEDTLS_LEGACY_CRYPTO_C
-- CMake and policy warnings (developer-level)
-- MCUboot warning about default signing key (debug-use key)
-- Partition manager warning about missing pm_static.yml when using bootloader
+- `CONFIG_GOLIOTH_LOG_LEVEL_DBG=y`, `CONFIG_NET_LOG=y`, `CONFIG_NET_SOCKETS_LOG_LEVEL_INF=y` — verbose Golioth, socket layer left less chatty to reduce UART interleaving.
 
-These did not block the later successful builds but should be cleaned up for production readiness.
+**ZVFS / eventfd (Golioth internal)**
 
-## 7. Current changed/untracked workspace state (high level)
+- `CONFIG_ZVFS=y`, `CONFIG_ZVFS_EVENTFD=y`, limits raised (`EVENTFD_MAX`, `OPEN_MAX`).
 
-Tracked files modified:
+**mbedTLS / ciphers**
 
-- Kconfig.sysbuild
-- prj.conf
-- src/main.c
+- PSK-focused key exchange, DHE variants off, `CONFIG_NORDIC_SECURITY_BACKEND=n`, `CONFIG_MBEDTLS_LEGACY_CRYPTO_C=y`
+- **`CONFIG_GOLIOTH_CIPHERSUITES="TLS_PSK_WITH_AES_128_GCM_SHA256 TLS_PSK_WITH_AES_128_CCM"`** — **GCM first, then CCM**. Golioth’s own `port/zephyr/Kconfig` defaults **`TLS_PSK_WITH_AES_128_GCM_SHA256`** for NCS+nRF when GCM is available. An earlier attempt used **CCM-only** to shrink ClientHello / avoid glue issues; runtime logs then showed **`TLS handshake error: -0x7780`** (fatal server alert), often consistent with **cipher negotiation mismatch**. Offering **GCM and CCM** matches cloud + upstream hello samples and avoids advertising only CCM.
+- AES, CCM, GCM, SHA256 enabled (`CONFIG_MBEDTLS_CIPHER_*`, `CONFIG_MBEDTLS_SHA256=y`).
+- **`CONFIG_MBEDTLS_PSK_MAX_LEN=64`** — Golioth PSKs must fit mbedTLS `mbedtls_ssl_conf_psk` limits.
 
-Untracked files relevant to this effort include:
+**Heaps (DTLS / allocation failures)**
 
-- overlay-golioth.conf
-- GOLIOTH_LOCATION_INTEGRATION_PLAN.md
-- sysbuild.conf
-- sysbuild/mcuboot.conf
-- build.log
-- build_stratus.log
-- build_stratus_mcuboot.log
+- `CONFIG_MBEDTLS_ENABLE_HEAP=y`
+- **`CONFIG_MBEDTLS_HEAP_SIZE=86016`**
+- **`CONFIG_HEAP_MEM_POOL_SIZE=57344`**
 
-## 8. Practical status
+Larger pairs (e.g. **98304 + 65536**) were tried to kill **ENOMEM (-12)** but **linked firmware overflowed nRF9160 non-secure RAM by ~11 KiB**; the **86016 / 57344** pair was chosen to **fit the linker map** while keeping substantial headroom for handshake allocations.
 
-- Build path has progressed from an earlier TF-M failure to successful full image generation.
-- Golioth integration code and overlay are now present.
-- The remaining work is mainly runtime verification on hardware/network and cleanup of warnings/security hardening (especially credentials and signing key handling).
+**Golioth DTLS handshake timeouts**
 
-## 9. Latest updates (May 6, 2026)
+- **`CONFIG_GOLIOTH_ZEPHYR_DTLS_HANDSHAKE_TIMEOUT_MIN_MS=-1`** and **`MAX_MS=-1`** — leave defaults so Golioth does not call `mbedtls_ssl_conf_handshake_timeout()` in a way that breaks config after non-default `setsockopt` ordering (**EINVAL -22** mitigation).
 
-The following reflects the most recent stabilization pass and build verification.
+**Stacks**
 
-### What was confirmed as fixed
+- `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=2048`, `CONFIG_MAIN_STACK_SIZE=4096` (overlay overrides smaller base `prj.conf` values where applicable).
 
-- Sysbuild + MCUboot flow now completes end-to-end and produces signed artifacts.
-- Application image links successfully after prior TF-M include/path issues.
-- The location app build and the MCUboot build both complete in the same run.
-- Final artifacts are generated, including merged image outputs and DFU package files.
+---
 
-### Configuration and integration state now in place
+## 3. `prj.conf` — base application + networking
 
-- Golioth enablement remains active through overlay-golioth.conf.
-- Network path remains pinned to an LTE-friendly IPv4 setup for modem offload behavior.
-- Golioth publish path in src/main.c remains wired to LOCATION_EVT_LOCATION with CBOR payload stream publishing.
-- Sysbuild/MCUboot settings remain in place to keep bootloader integration stable.
+**Heap/stacks (base; overlay overrides for Golioth build)**
 
-### Current non-blocking warnings still present
+- Default `CONFIG_MAIN_STACK_SIZE=2048`, `CONFIG_HEAP_MEM_POOL_SIZE=8192`, `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=1536`, `CONFIG_AT_MONITOR_HEAP_SIZE=1024`
 
-- Deprecated symbols still reported:
-  - NRF_CLOUD_REST
-  - MBEDTLS_LEGACY_CRYPTO_C
-- MCUboot warning about use of default debug signing key.
-- Partition manager warning about running bootloader flow without pm_static.yml.
+**Networking (required with overlay)**
 
-These do not block builds but should be treated as production hardening items.
+- `CONFIG_NETWORKING=y`, `CONFIG_NET_NATIVE=y`, `CONFIG_NET_SOCKETS=y`, **`CONFIG_NET_SOCKETS_OFFLOAD=y`** — modem provides L2; Zephyr IP stack + sockets used for native DTLS to Golioth.
 
-### Immediate next hardening actions
+**LTE / GNSS / sensors / logging**
 
-- Replace default MCUboot signing key with project-owned key material.
-- Add a fixed pm_static.yml partition map for upgrade-safe releases.
-- Remove or replace deprecated Kconfig symbols where possible.
-- Perform on-device runtime verification of LTE attach, DNS, Golioth connect, and stream upload.
+- Unchanged theme: LTE-M + GNSS, PSM/eDRX tweaks for GNSS windows, `DATE_TIME`, onboard SHT40 + LIS2DH, UART logging with `CONFIG_LOG_PRINTK=y`, nRF Cloud disabled for standalone GNSS validation.
 
-## 10. Latest build recovery updates (May 8, 2026)
+---
 
-This section captures the full set of changes needed to get this repository building on the Stratus 9160 path in this environment.
+## 4. `src/main.c` — provisioning order, PSK handling, readiness, diagnostics
 
-### 10.1 Board migration to nRF9160 (from nRF9161)
+**Boot order (credential safety)**
 
-The active custom board root was migrated to 9160 naming and symbols:
+1. Optional modem/AT diagnostics as implemented in app.
+2. **`golioth_provision_psk_credentials()`** runs **before** `lte_lc_register_handler()` / **`lte_lc_connect()`** so PSK is in volatile TLS storage **before** LTE attach competes with modem rules.
 
-- Updated:
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/board.yml`
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/board.cmake`
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/Kconfig.conexio_stratus_pro`
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/Kconfig.defconfig`
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_partition_conf.dtsi`
-- Renamed/created board files for 9160:
-  - `conexio_stratus_pro_nrf9160.dts`
-  - `conexio_stratus_pro_nrf9160_ns.dts`
-  - `conexio_stratus_pro_nrf9160_defconfig`
-  - `conexio_stratus_pro_nrf9160_ns_defconfig`
-- Removed old `nrf9161` board file variants from the v3 board folder.
+**PSK material**
 
-### 10.2 Repository cleanup requested
+- Credentials from **`CONFIG_GOLIOTH_SAMPLE_PSK_ID`** / **`CONFIG_GOLIOTH_SAMPLE_PSK`** (typically via `credentials.conf`).
+- **Hex decode**: if the PSK string is exactly **64 or 128** characters and all hex, firmware decodes to **raw key bytes** (Golioth console often shows hex; mbedTLS needs bytes, not ASCII hex — avoids **`mbedtls_ssl_conf_psk` / EINVAL**).
+- **`tls_credential_delete` / `tls_credential_add`** for `TLS_CREDENTIAL_PSK_ID` and `TLS_CREDENTIAL_PSK` on the Golioth sec tag.
 
-Per cleanup request, removed:
+**mbedTLS self-test**
 
-- all current build directories at the time
-- `conexio_board_root`
-- `conexio_stratus_pro_devicetree`
+- **`golioth_mbedtls_psk_selftest()`** — minimal `mbedtls_ssl_config_defaults` + **`mbedtls_ssl_conf_psk`** to confirm PSK bytes are accepted (**“ssl_conf_psk OK”** in logs separates mbedTLS config failures from **socket-layer -12 / -22**).
 
-This left `conexio_board_root_v3` as the active custom board source.
+**Network readiness before Golioth client**
 
-### 10.3 Build environment diagnosis
+- **`wait_for_network_ready()`**: interface up / connected semantics, IPv4 check, then **`wait_for_golioth_dns()`** with retries for **`coap.golioth.io:5684`**, plus UDP probe logging — client creation happens **after** LTE + DNS succeed.
 
-Builds initially failed with many "undefined symbol" errors in `prj.conf` while using a non-matching SDK/workspace context.
+**Golioth client**
 
-Root cause findings:
+- `golioth_client` with **`GOLIOTH_TLS_AUTH_TYPE_TAG`** and tag **42**.
+- Stream publish on location events / status helpers as implemented (`golioth_stream_set`, JSON payloads).
 
-- The command in this repo referenced `C:/ncs/v3.2.0/...`.
-- Local machine has `C:/ncs/v3.2.3`, not `v3.2.0`.
-- `golioth-firmware-sdk` was missing from `C:/ncs/v3.2.3/modules/lib`.
+**LED / heartbeat**
 
-### 10.4 Golioth module installation in NCS v3.2.3
+- **`boot_mark()`** stages and optional LED blink patterns to show where boot hangs (e.g. `golioth_wait_connected`).
 
-Installed missing module:
+---
 
-- cloned `https://github.com/golioth/golioth-firmware-sdk.git` to
-  - `C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk`
-- verified module metadata exists:
-  - `C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk/zephyr/module.yml`
+## 5. Credentials and build invocation
 
-### 10.5 Config symbol compatibility fixes for current NCS
+**`credentials.conf.sample`**
 
-`NPM13XX_CHARGER` is not a valid symbol in this build path and caused hard Kconfig failures.
+- Documents copying to **`credentials.conf`** (gitignored) and **`CONFIG_GOLIOTH_SAMPLE_PSK_ID` / `CONFIG_GOLIOTH_SAMPLE_PSK`**.
+- Notes **full hex paste** when the console shows 64/128 hex nibbles.
 
-Actions taken:
+**Typical extra config**
 
-- Removed/updated charger symbol usage in:
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_nrf9160_defconfig`
-  - `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_nrf9160_ns_defconfig`
-  - `sysbuild/mcuboot.conf`
-
-### 10.6 Sysbuild/mcuboot board qualification fix
-
-A TF-M target mismatch appeared when MCUboot was being built using the non-secure board qualifier.
-
-Fix:
-
-- Explicitly set MCUboot image board to secure qualifier via build arg:
-  - `-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160`
-
-### 10.7 Windows path translation failure and final fix
-
-After configuration passed, build failed at Ninja stage with:
-
-- missing dependency path in POSIX style:
-  - `/c/ncs/v3.2.3/nrf/.git`
-
-On this Windows setup, that path did not resolve during the build step, even though `C:\ncs\v3.2.3\nrf\.git` existed.
-
-Fix applied:
-
-- created junction:
-  - `C:\c -> C:\`
-
-This made `/c/...` paths resolvable for the generated dependency chain and unblocked the build.
-
-### 10.8 Final working build command (validated)
-
-Run from NCS 3.2.3 workspace context:
-
-```powershell
-west build --sysbuild -p always -d C:/Users/Brian/location_conexio_9161/build -b conexio_stratus_pro/nrf9160/ns C:/Users/Brian/location_conexio_9161 -- "-DBOARD_ROOT=C:/Users/Brian/location_conexio_9161/conexio_board_root_v3" "-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160" "-DZEPHYR_EXTRA_MODULES=C:/ncs/v3.2.3/modules/lib/golioth-firmware-sdk" "-DEXTRA_CONF_FILE=overlay-golioth.conf"
+```text
+-DEXTRA_CONF_FILE="overlay-golioth.conf;credentials.conf"
+-DZEPHYR_EXTRA_MODULES=<path-to>/golioth-firmware-sdk
+-DBOARD_ROOT=<path-to>/conexio_board_root_v3
 ```
 
-### 10.9 Final successful build indicators
+MCUboot sysbuild may use **`-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160`** (secure board for bootloader image).
 
-Successful run produced:
+---
 
-- full compile/link completion for app and MCUboot
-- `dfu_application.zip`
-- `merged.hex`
+## 6. Items tried or rejected during debugging
+
+| Item | Result |
+|------|--------|
+| **`CONFIG_MBEDTLS_DEBUG=y`** | Link failure: `mbedtls_debug_set_threshold` not resolved with current **nrf_security** wiring — not left enabled. |
+| Very large **`MBEDTLS_HEAP_SIZE` + `HEAP_MEM_POOL_SIZE`** | Fixed **ENOMEM** risk but **RAM region overflow** at link time; reduced to **86016 / 57344** so the image fits. |
+| **`CONFIG_GOLIOTH_CIPHERSUITES` CCM-only** | After **ENOMEM (-12)** was addressed, logs showed **`-0x7780` / -113**; ciphers updated to **GCM + CCM** (see §2). |
+
+---
+
+## 7. Board repository and build environment (condensed)
+
+- Custom board under **`conexio_board_root_v3`** for **Stratus Pro nRF9160** (`*_nrf9160*.dts`, `*_ns`, defconfigs). Older nRF9161 filenames were migrated away where applicable.
+- **NCS v3.2.3** (paths in docs may say v3.2.0 — use the toolchain actually installed).
+- **`golioth-firmware-sdk`** must exist under **`modules/lib/golioth-firmware-sdk`** (or passed via **`ZEPHYR_EXTRA_MODULES`**).
+- Invalid **`NPM13XX_CHARGER`** Kconfig symbols were removed from board/mcuboot configs where they broke Kconfig on this SDK.
+- On **Windows**, some builds needed a **`C:\c` → `C:\`** junction so **`/c/ncs/...`** dependency paths resolve during Ninja (environment-specific).
+
+---
+
+## 8. Current status and suggested next steps
+
+- **Build**: With **86016 / 57344** heaps and **GCM+CCM** ciphers, **`west build --sysbuild`** completes for **`conexio_stratus_pro/nrf9160/ns`** when RAM fits.
+- **Runtime progression observed**: **`ssl_conf_psk OK`** → LTE/DNS OK → earlier **`Failed to connect: -12`** addressed via heaps → then **`TLS handshake error: -0x7780`** and **`Failed to connect: -113`** (fatal server alert + **`ECONNABORTED`**), addressed in config by **not** restricting ClientHello to **CCM-only**.
+- **Next on hardware**: Flash the build with **`TLS_PSK_WITH_AES_128_GCM_SHA256 TLS_PSK_WITH_AES_128_CCM`** and confirm **Connected to Golioth**. If **`-0x7780`** persists, treat as **credentials / project pairing**: exact **`CONFIG_GOLIOTH_SAMPLE_PSK_ID`**, full PSK (including **64-hex** decode path), device registered in the correct Golioth project — not heap size.
+- If **ENOMEM (-12)** reappears after further changes: increase heaps only within linker margin, or raise **`CONFIG_GOLIOTH_COAP_THREAD_STACK_SIZE`**, or trim other RAM consumers.
+- If connect succeeds: validate **LightDB stream** payloads and consider removing or `#ifdef`-gating **`golioth_mbedtls_psk_selftest()`** for production boot time and log noise.
+- **Production**: replace MCUboot default signing key, add **`pm_static.yml`** if required by release policy, and keep **`credentials.conf`** out of version control.
