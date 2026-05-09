@@ -72,9 +72,9 @@
 			   <23 0 &gpio0 23 0>,	/* D23 */
 			   <24 0 &gpio0 24 0>,	/* D24 */
 			   /* 25 not connected */
-			   <26 0 &gpio0 26 0>,	/* D26 */
-			   <27 0 &gpio0 27 0>,	/* D27/RX */
-			   <28 0 &gpio0 28 0>;	/* D28/TX */
+			   <26 0 &gpio0 26 0>,	/* D26 / sensor I2C SDA (SHT40+LIS2DH, TWIM1) */
+			   <27 0 &gpio0 27 0>,	/* D27 / sensor I2C SCL */
+			   <28 0 &gpio0 28 0>;	/* D28 (not sensor SDA; see schematic) */
 	};
 
 	/* These aliases are provided for compatibility with samples */
@@ -82,18 +82,18 @@
 		led0 = &led0;
 		pwm-led0 = &pwm_led0;
 		sw0 = &button0;
+		sht40 = &sht40;
+		accel0 = &lis2dh12_ext;
 		bootloader-led0 = &led0;
 		mcuboot-button0 = &button0;
 		mcuboot-led0 = &led0;
 		watchdog0 = &wdt0;
 	};
 
-	sensor-pwr-ctrl {
-		compatible = "regulator-fixed";
-		regulator-name = "sensor-power";
-		enable-gpios = <&gpio0 26 GPIO_ACTIVE_HIGH>;
-		regulator-boot-on;
-	};
+	/*
+	 * Do not drive P0.26 as GPIO: Stratus V3 routes it to sensor I2C SDA (SHT40 + LIS2DH).
+	 * Sensor rails are supplied in hardware (+3V3); no separate enable line on P0.26.
+	 */
 };
 
 &adc {
@@ -110,10 +110,37 @@
 
 &uart0 {
 	status = "okay";
-		current-speed = <460800>;
+	current-speed = <115200>;
 	pinctrl-0 = <&uart0_default>;
 	pinctrl-1 = <&uart0_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+/*
+ * TWIM1 on P0.27 (SCL) / P0.26 (SDA): onboard SHT40 + LIS2DH12 (same bus; Stratus V3 schematic).
+ * UART1 is disabled for TF-M, so this peripheral instance is available.
+ */
+&i2c1 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c1_sensor_default>;
+	pinctrl-1 = <&i2c1_sensor_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	/* SHT40-AD1B-R2: change reg to 0x45 if ADDR is tied high */
+	sht40: sht40@44 {
+		compatible = "sensirion,sht4x";
+		reg = <0x44>;
+		repeatability = <1>;
+	};
+
+	/* LIS2DH12TR: use reg 0x19 if SA0/SDO is high */
+	lis2dh12_ext: lis2dh12@18 {
+		compatible = "st,lis2dh12";
+		reg = <0x18>;
+		disconnect-sdo-sa0-pull-up;
+	};
 };
 
 &i2c2 {
@@ -151,13 +178,6 @@
 				regulator-boot-on;
 			};
 		};
-	};
-
-	lis2dh: lis2dh@18 {
-		compatible = "st,lis2dh";
-		reg = <0x18>;
-		irq-gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>;
-		disconnect-sdo-sa0-pull-up;
 	};
 
 	eeprom0: eeprom@50 {

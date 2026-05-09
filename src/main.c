@@ -8,6 +8,9 @@
 #include <errno.h>
 #include <stdio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/devicetree.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
 #include <modem/location.h>
@@ -167,6 +170,94 @@ static K_SEM_DEFINE(time_update_finished, 0, 1);
 static struct k_work_delayable gnss_progress_work;
 static bool gnss_debug_active;
 static int64_t gnss_debug_start_ms;
+static struct k_work_delayable boot_heartbeat_work;
+static bool modem_ready_for_debug;
+static const char *boot_stage = "reset";
+static struct k_work_delayable boot_led_work;
+static bool boot_lte_registered;
+static bool boot_led_state;
+
+#if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
+static const struct device *const sht40_dev = DEVICE_DT_GET(DT_ALIAS(sht40));
+#endif
+#if IS_ENABLED(CONFIG_LIS2DH) && DT_NODE_HAS_STATUS(DT_ALIAS(accel0), okay)
+static const struct device *const accel_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
+#endif
+
+#if (IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)) || \
+	(IS_ENABLED(CONFIG_LIS2DH) && DT_NODE_HAS_STATUS(DT_ALIAS(accel0), okay))
+static struct k_work_delayable sensor_poll_work;
+
+static void sensor_poll_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+#if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
+	if (device_is_ready(sht40_dev)) {
+		struct sensor_value t, rh;
+		int err = sensor_sample_fetch(sht40_dev);
+
+		if (err) {
+			printk("[sensor] SHT40 fetch failed: %d\n", err);
+		} else {
+			err = sensor_channel_get(sht40_dev, SENSOR_CHAN_AMBIENT_TEMP, &t);
+			if (!err) {
+				err = sensor_channel_get(sht40_dev, SENSOR_CHAN_HUMIDITY, &rh);
+			}
+			if (err) {
+				printk("[sensor] SHT40 channel read failed: %d\n", err);
+			} else {
+				printk("[sensor] SHT40: %.2f degC, %.1f %%RH\n",
+				       sensor_value_to_double(&t),
+				       sensor_value_to_double(&rh));
+			}
+		}
+	} else {
+		printk("[sensor] SHT40 not ready\n");
+	}
+#endif
+
+#if IS_ENABLED(CONFIG_LIS2DH) && DT_NODE_HAS_STATUS(DT_ALIAS(accel0), okay)
+	if (device_is_ready(accel_dev)) {
+		struct sensor_value acc[3];
+		int err = sensor_sample_fetch(accel_dev);
+
+		if (err) {
+			printk("[sensor] LIS2DH fetch failed: %d\n", err);
+		} else {
+			err = sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, acc);
+			if (err) {
+				printk("[sensor] LIS2DH channel read failed: %d\n", err);
+			} else {
+				printk("[sensor] LIS2DH (m/s^2): X=%.3f Y=%.3f Z=%.3f\n",
+				       sensor_value_to_double(&acc[0]),
+				       sensor_value_to_double(&acc[1]),
+				       sensor_value_to_double(&acc[2]));
+			}
+		}
+	} else {
+		printk("[sensor] LIS2DH not ready\n");
+	}
+#endif
+
+	k_work_reschedule(&sensor_poll_work, K_SECONDS(10));
+}
+#endif
+
+#define BOOT_LED_NODE DT_ALIAS(led0)
+#if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
+static const struct gpio_dt_spec boot_led = GPIO_DT_SPEC_GET(BOOT_LED_NODE, gpios);
+static bool boot_led_ready;
+#endif
+
+static void boot_mark(const char *stage)
+{
+	boot_stage = stage;
+	if (!strcmp(stage, "lte_registered")) {
+		boot_lte_registered = true;
+	}
+	printk("[boot] stage=%s uptime=%lld ms\n", boot_stage, k_uptime_get());
+}
 
 static void log_modem_snapshot(const char *cmd, const char *tag)
 {
@@ -196,6 +287,40 @@ static void gnss_progress_work_handler(struct k_work *work)
 	log_modem_snapshot("AT%XMONITOR", "XMONITOR");
 
 	k_work_reschedule(&gnss_progress_work, K_SECONDS(30));
+}
+
+static void boot_heartbeat_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	printk("[boot] heartbeat stage=%s uptime=%lld ms\n",
+	       boot_stage, k_uptime_get());
+
+	if (modem_ready_for_debug) {
+		log_modem_snapshot("AT+CFUN?", "CFUN");
+		log_modem_snapshot("AT+CEREG?", "CEREG");
+		log_modem_snapshot("AT%XSYSTEMMODE?", "XSYSTEMMODE");
+	}
+
+	k_work_reschedule(&boot_heartbeat_work, K_SECONDS(15));
+}
+
+static void boot_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+#if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
+	if (!boot_led_ready) {
+		return;
+	}
+
+	boot_led_state = !boot_led_state;
+	(void)gpio_pin_set_dt(&boot_led, (int)boot_led_state);
+
+	/* Faster blink during early boot; slower once registered on LTE. */
+	k_work_reschedule(&boot_led_work,
+			  boot_lte_registered ? K_MSEC(900) : K_MSEC(200));
+#endif
 }
 
 static void gnss_progress_start(const char *context)
@@ -587,10 +712,39 @@ int main(void)
 	int err;
 
 	k_work_init_delayable(&gnss_progress_work, gnss_progress_work_handler);
+	k_work_init_delayable(&boot_heartbeat_work, boot_heartbeat_work_handler);
+	k_work_init_delayable(&boot_led_work, boot_led_work_handler);
+
+#if (IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)) || \
+	(IS_ENABLED(CONFIG_LIS2DH) && DT_NODE_HAS_STATUS(DT_ALIAS(accel0), okay))
+	k_work_init_delayable(&sensor_poll_work, sensor_poll_work_handler);
+	k_work_reschedule(&sensor_poll_work, K_SECONDS(10));
+	printk("[sensor] printing SHT40 + LIS2DH every 10 s\n");
+#endif
+
+#if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
+	if (gpio_is_ready_dt(&boot_led)) {
+		if (!gpio_pin_configure_dt(&boot_led, GPIO_OUTPUT_INACTIVE)) {
+			boot_led_ready = true;
+			k_work_reschedule(&boot_led_work, K_NO_WAIT);
+			printk("[boot] LED debug blink enabled on led0\n");
+		} else {
+			printk("[boot] failed to configure led0 for debug blink\n");
+		}
+	} else {
+		printk("[boot] led0 GPIO not ready for debug blink\n");
+	}
+#else
+	printk("[boot] no led0 alias available for debug blink\n");
+#endif
+
+	k_work_reschedule(&boot_heartbeat_work, K_SECONDS(5));
+	boot_mark("main_entry");
 
 	printk("Location sample started\n\n");
 
 	if (IS_ENABLED(CONFIG_DATE_TIME)) {
+		boot_mark("date_time_handler_register");
 		/* Registering early for date_time event handler to avoid missing
 		 * the first event after LTE is connected.
 		 */
@@ -601,19 +755,27 @@ int main(void)
 	printk("Connecting to LTE...\n");
 
 	if (!IS_ENABLED(CONFIG_NRF_MODEM_LIB_NET_IF_AUTO_START)) {
+		boot_mark("nrf_modem_lib_init_begin");
 		printk("[lte] manual modem init path\n");
 		err = nrf_modem_lib_init();
 		if (err) {
 			printk("Modem library initialization failed, error: %d\n", err);
 			return err;
 		}
+		modem_ready_for_debug = true;
+		boot_mark("nrf_modem_lib_init_done");
 		printk("[lte] modem library initialized\n");
 	}
+	modem_ready_for_debug = true;
+	log_modem_snapshot("AT+CFUN?", "CFUN");
+	log_modem_snapshot("AT%XMODEMUUID", "MODEMUUID");
 
+	boot_mark("lte_handler_register");
 	printk("[lte] registering LTE event handler\n");
 	lte_lc_register_handler(lte_event_handler);
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	boot_mark("golioth_psk_provision");
 	/*
 	 * nRF91 offloaded DTLS uses modem sec tags. Provision the PSK credentials
 	 * before LTE activation so the secure tag is ready for the DTLS session.
@@ -625,6 +787,7 @@ int main(void)
 #endif
 
 	if (!lte_is_registered()) {
+		boot_mark("lte_connect_request");
 		printk("[lte] requesting LTE connection\n");
 		err = lte_lc_connect();
 		if (err) {
@@ -634,17 +797,21 @@ int main(void)
 	}
 
 	if (!lte_is_registered()) {
+		boot_mark("lte_wait_registered");
 		printk("[lte] waiting for LTE registration semaphore\n");
 		k_sem_take(&lte_connected, K_FOREVER);
 		printk("[lte] LTE registration semaphore received\n");
 	}
+	boot_mark("lte_registered");
 
+	boot_mark("gnss_antenna_enable");
 	err = enable_onboard_gnss_antenna_if_needed();
 	if (err) {
 		return err;
 	}
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	boot_mark("network_wait_ready");
 	printk("[net] waiting for usable network\n");
 	err = wait_for_network_ready();
 	if (err) {
@@ -652,6 +819,7 @@ int main(void)
 		return err;
 	}
 
+	boot_mark("golioth_client_create");
 	printk("[golioth] creating client after LTE/network readiness\n");
 	golioth_client = golioth_client_create(&golioth_cfg);
 	if (!golioth_client) {
@@ -660,6 +828,7 @@ int main(void)
 	}
 	printk("[golioth] client created: %p\n", golioth_client);
 
+	boot_mark("golioth_wait_connected");
 	printk("Connecting to Golioth...\n");
 	printk("[golioth] using sec tag %d\n",
 	       CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG);
@@ -679,6 +848,7 @@ int main(void)
 
 	/* A-GNSS/P-GPS needs to know the current time. */
 	if (IS_ENABLED(CONFIG_DATE_TIME)) {
+		boot_mark("date_time_wait");
 		printk("Waiting for current time\n");
 
 		/* Wait for an event from the Date Time library. */
@@ -692,6 +862,7 @@ int main(void)
 		}
 	}
 
+	boot_mark("location_init");
 	printk("[location] initializing Location library\n");
 	err = location_init(location_event_handler);
 	if (err) {
@@ -700,6 +871,7 @@ int main(void)
 	}
 	printk("[location] Location library initialized\n");
 
+	boot_mark("location_high_accuracy_start");
 	location_gnss_high_accuracy_get();
 
 #if defined(CONFIG_LOCATION_METHOD_WIFI)
@@ -707,6 +879,7 @@ int main(void)
 #endif
 
 	location_gnss_periodic_get();
+	boot_mark("location_periodic_running");
 
 	return 0;
 }
