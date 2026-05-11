@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/gpio.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
 #include <modem/location.h>
@@ -163,6 +164,78 @@ static K_SEM_DEFINE(location_event, 0, 1);
 static K_SEM_DEFINE(lte_connected, 0, 1);
 
 static K_SEM_DEFINE(time_update_finished, 0, 1);
+
+#if IS_ENABLED(CONFIG_SOLAR_ENERGY_CLICK_MONITOR)
+static struct k_work_delayable solar_click_monitor_work;
+
+static void solar_click_monitor_log(void)
+{
+	const struct device *gpio = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	int blv, hlv, wup;
+
+	if (!device_is_ready(gpio)) {
+		printk("[solar_click] gpio0 not ready\n");
+		return;
+	}
+
+	blv = gpio_pin_get(gpio, CONFIG_SOLAR_ENERGY_CLICK_GPIO_BLV);
+	hlv = gpio_pin_get(gpio, CONFIG_SOLAR_ENERGY_CLICK_GPIO_HLV);
+	wup = gpio_pin_get(gpio, CONFIG_SOLAR_ENERGY_CLICK_GPIO_WUP);
+
+	printk("[solar_click] BLV=P0.%02d=%d HLV=P0.%02d=%d WUP=P0.%02d=%d (raw; 1=high)\n",
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_BLV, blv,
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_HLV, hlv,
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_WUP, wup);
+}
+
+static void solar_click_monitor_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	solar_click_monitor_log();
+	k_work_schedule(&solar_click_monitor_work,
+			 K_SECONDS(CONFIG_SOLAR_ENERGY_CLICK_MONITOR_INTERVAL_SEC));
+}
+
+static int solar_click_monitor_init(void)
+{
+	const struct device *gpio = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	const int pins[] = {
+		CONFIG_SOLAR_ENERGY_CLICK_GPIO_BLV,
+		CONFIG_SOLAR_ENERGY_CLICK_GPIO_HLV,
+		CONFIG_SOLAR_ENERGY_CLICK_GPIO_WUP,
+	};
+	int err;
+
+	if (!device_is_ready(gpio)) {
+		printk("[solar_click] gpio0 not ready; monitor disabled\n");
+		return -ENODEV;
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(pins); i++) {
+		err = gpio_pin_configure(gpio, pins[i], GPIO_INPUT);
+		if (err) {
+			printk("[solar_click] failed to configure P0.%02d as input: %d\n",
+			       pins[i], err);
+			return err;
+		}
+	}
+
+	printk("[solar_click] monitoring BLV=P0.%02d HLV=P0.%02d WUP=P0.%02d every %d s\n",
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_BLV,
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_HLV,
+	       CONFIG_SOLAR_ENERGY_CLICK_GPIO_WUP,
+	       CONFIG_SOLAR_ENERGY_CLICK_MONITOR_INTERVAL_SEC);
+
+	solar_click_monitor_log();
+
+	k_work_init_delayable(&solar_click_monitor_work, solar_click_monitor_work_handler);
+	k_work_schedule(&solar_click_monitor_work,
+			 K_SECONDS(CONFIG_SOLAR_ENERGY_CLICK_MONITOR_INTERVAL_SEC));
+
+	return 0;
+}
+#endif /* CONFIG_SOLAR_ENERGY_CLICK_MONITOR */
 
 static struct k_work_delayable gnss_progress_work;
 static bool gnss_debug_active;
@@ -685,6 +758,14 @@ int main(void)
 	k_work_init_delayable(&gnss_progress_work, gnss_progress_work_handler);
 
 	printk("Location sample started\n\n");
+
+#if IS_ENABLED(CONFIG_SOLAR_ENERGY_CLICK_MONITOR)
+	err = solar_click_monitor_init();
+	if (err) {
+		printk("[solar_click] init failed (%d); continuing without click GPIO monitor\n",
+		       err);
+	}
+#endif
 
 	if (IS_ENABLED(CONFIG_DATE_TIME)) {
 		/* Registering early for date_time event handler to avoid missing
