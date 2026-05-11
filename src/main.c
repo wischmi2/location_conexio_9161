@@ -5,6 +5,7 @@
  */
 
 #include <ctype.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -20,8 +21,6 @@
 #include <date_time.h>
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
-#include <mbedtls/ssl.h>
-#include <zephyr/net/tls_credentials.h>
 #include <golioth/client.h>
 #include <golioth/stream.h>
 #include <zephyr/net/net_if.h>
@@ -33,8 +32,9 @@
 #define GOLIOTH_PSK_ID CONFIG_GOLIOTH_SAMPLE_PSK_ID
 #define GOLIOTH_PSK    CONFIG_GOLIOTH_SAMPLE_PSK
 
-/* Golioth console often shows the PSK as a hex string (e.g. 64 nibbles = 32 bytes). mbedTLS
- * needs the raw key bytes — passing ASCII hex fails mbedtls_ssl_conf_psk() (connect EINVAL).
+/* If PSK in Kconfig is 64/128 hex chars (Golioth UI), decode to raw bytes then re-encode as
+ * lowercase hex for AT%%CMNG. Otherwise use master behavior: hex-encode each ASCII byte of
+ * CONFIG_GOLIOTH_SAMPLE_PSK for the modem.
  */
 static bool golioth_psk_string_is_hex(const char *s, size_t len)
 {
@@ -91,37 +91,6 @@ static int golioth_psk_hex_decode(const char *hex, size_t hex_len, uint8_t *out,
 	return 0;
 }
 
-static void golioth_mbedtls_psk_selftest(const void *psk_raw, size_t psk_raw_len, const char *psk_id,
-					 size_t psk_id_len)
-{
-	mbedtls_ssl_config conf;
-	int ret;
-
-	mbedtls_ssl_config_init(&conf);
-
-	ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
-					  MBEDTLS_SSL_TRANSPORT_DATAGRAM,
-					  MBEDTLS_SSL_PRESET_DEFAULT);
-	if (ret != 0) {
-		printk("[golioth] mbed selftest: ssl_config_defaults rc=%d (-0x%04x)\n", ret,
-		       (unsigned int)(ret < 0 ? -ret : 0));
-		goto done;
-	}
-
-	ret = mbedtls_ssl_conf_psk(&conf, (const unsigned char *)psk_raw, psk_raw_len,
-				   (const unsigned char *)psk_id, psk_id_len);
-	if (ret != 0) {
-		printk("[golioth] mbed selftest: ssl_conf_psk rc=%d (-0x%04x)\n", ret,
-		       (unsigned int)(ret < 0 ? -ret : 0));
-	} else {
-		printk("[golioth] mbed selftest: ssl_conf_psk OK (use this to distinguish "
-		       "mbedTLS vs socket layer)\n");
-	}
-
-done:
-	mbedtls_ssl_config_free(&conf);
-}
-
 static struct golioth_client *golioth_client;
 static K_SEM_DEFINE(golioth_connected_sem, 0, 1);
 
@@ -134,14 +103,15 @@ static const struct golioth_client_config golioth_cfg = {
 
 static int golioth_provision_psk_credentials(void)
 {
+	/* 64-byte key as hex = 128 chars + NUL fits; master used 2 * CONFIG string len */
+	char psk_hex[256];
+	const char hex_digits[] = "0123456789abcdef";
 	const char *psk_id = GOLIOTH_PSK_ID;
 	const char *psk = GOLIOTH_PSK;
 	const size_t psk_id_len = strlen(psk_id);
 	const size_t psk_ascii_len = strlen(psk);
-	sec_tag_t tag = (sec_tag_t)CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG;
-	uint8_t psk_bin[128];
-	const void *psk_material = psk;
-	size_t psk_len = psk_ascii_len;
+	const int tag = CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG;
+	uint8_t psk_bin[64];
 	int err;
 
 	if (psk_id_len == 0 || psk_ascii_len == 0) {
@@ -151,55 +121,60 @@ static int golioth_provision_psk_credentials(void)
 		return -EINVAL;
 	}
 
-	/* Golioth normally shows the secret as 64 or 128 hex nibbles; only those lengths are
-	 * decoded so a 32-char alphanumeric passphrase is not reinterpreted as hex.
-	 */
 	if ((psk_ascii_len == 64U || psk_ascii_len == 128U) &&
 	    golioth_psk_string_is_hex(psk, psk_ascii_len)) {
+		size_t raw_len;
+
 		err = golioth_psk_hex_decode(psk, psk_ascii_len, psk_bin, sizeof(psk_bin),
-					   &psk_len);
+					   &raw_len);
 		if (err) {
-			printk("[golioth] PSK hex decode failed (check length / MBEDTLS_PSK_MAX_LEN)\n");
+			printk("[golioth] PSK hex decode failed\n");
 			return err;
 		}
 
-		psk_material = psk_bin;
-		printk("[dbg] golioth PSK: hex string %zu chars -> %zu raw bytes\n", psk_ascii_len,
-		       psk_len);
+		if (2U * raw_len + 1U > sizeof(psk_hex)) {
+			return -EINVAL;
+		}
+
+		for (size_t i = 0; i < raw_len; i++) {
+			psk_hex[2 * i] = hex_digits[psk_bin[i] >> 4];
+			psk_hex[2 * i + 1] = hex_digits[psk_bin[i] & 0x0f];
+		}
+		psk_hex[2 * raw_len] = '\0';
+		printk("[golioth] PSK: Golioth hex UI %zu chars -> %zu key bytes -> modem\n",
+		       psk_ascii_len, raw_len);
+	} else {
+		if (psk_ascii_len * 2U + 1U > sizeof(psk_hex)) {
+			printk("[golioth] PSK too long for modem buffer\n");
+			return -EINVAL;
+		}
+
+		for (size_t i = 0; i < psk_ascii_len; i++) {
+			unsigned char value = (unsigned char)psk[i];
+
+			psk_hex[i * 2] = hex_digits[value >> 4];
+			psk_hex[i * 2 + 1] = hex_digits[value & 0x0f];
+		}
+		psk_hex[psk_ascii_len * 2] = '\0';
 	}
 
-	printk("[dbg] golioth PSK provision: sec_tag=%u psk_id_len=%zu psk_len=%zu\n",
-	       (unsigned int)tag, psk_id_len, psk_len);
+	/* Ignore delete failures when the credentials do not exist yet. */
+	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,4", tag);
+	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,3", tag);
 
-	/*
-	 * Native mbedTLS DTLS uses Zephyr tls_credential_* (volatile backend). Modem-only
-	 * storage does not expose PSK entries to mbedtls (ENOENT during handshake).
-	 */
-	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK_ID);
-	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK);
-
-	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK_ID, psk_id, psk_id_len);
+	err = nrf_modem_at_printf("AT%%CMNG=0,%d,4,\"%s\"", tag, psk_id);
 	if (err) {
-		printk("[golioth] tls_credential_add PSK_ID failed for tag %u: %d\n",
-		       (unsigned int)tag, err);
+		printk("[golioth] failed to provision PSK ID to sec tag %d: %d\n", tag, err);
 		return err;
 	}
 
-	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK, psk_material, psk_len);
+	err = nrf_modem_at_printf("AT%%CMNG=0,%d,3,\"%s\"", tag, psk_hex);
 	if (err) {
-		printk("[golioth] tls_credential_add PSK failed for tag %u: %d\n",
-		       (unsigned int)tag, err);
+		printk("[golioth] failed to provision PSK to sec tag %d: %d\n", tag, err);
 		return err;
 	}
 
-	printk("[golioth] provisioned PSK credentials (volatile) for sec tag %u\n",
-	       (unsigned int)tag);
-
-	/*
-	 * Zephyr maps mbedTLS setup failures to connect() EINVAL (-22). Call mbedTLS
-	 * directly once so the console shows the real mbed error code (e.g. -0x7100).
-	 */
-	golioth_mbedtls_psk_selftest(psk_material, psk_len, psk_id, psk_id_len);
+	printk("[golioth] provisioned PSK credentials to modem sec tag %d\n", tag);
 
 	return 0;
 }
@@ -1188,7 +1163,7 @@ int main(void)
 	log_modem_snapshot("AT%XMODEMUUID", "MODEMUUID");
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
-	/* Register PSK in Zephyr TLS store before Golioth DTLS (after modem AT probe). */
+	/* Modem sec tag PSK via AT%%CMNG before LTE (matches master / stratus9161 path). */
 	boot_mark("golioth_psk_provision");
 	err = golioth_provision_psk_credentials();
 	if (err) {
