@@ -5,7 +5,6 @@
  */
 
 #include <ctype.h>
-#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -21,6 +20,8 @@
 #include <date_time.h>
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+#include <mbedtls/ssl.h>
+#include <zephyr/net/tls_credentials.h>
 #include <golioth/client.h>
 #include <golioth/stream.h>
 #include <zephyr/net/net_if.h>
@@ -32,9 +33,8 @@
 #define GOLIOTH_PSK_ID CONFIG_GOLIOTH_SAMPLE_PSK_ID
 #define GOLIOTH_PSK    CONFIG_GOLIOTH_SAMPLE_PSK
 
-/* If PSK in Kconfig is 64/128 hex chars (Golioth UI), decode to raw bytes then re-encode as
- * lowercase hex for AT%%CMNG. Otherwise use master behavior: hex-encode each ASCII byte of
- * CONFIG_GOLIOTH_SAMPLE_PSK for the modem.
+/* Golioth console often shows the PSK as a hex string (e.g. 64 nibbles = 32 bytes). mbedTLS
+ * needs the raw key bytes — passing ASCII hex fails mbedtls_ssl_conf_psk() (connect EINVAL).
  */
 static bool golioth_psk_string_is_hex(const char *s, size_t len)
 {
@@ -91,6 +91,37 @@ static int golioth_psk_hex_decode(const char *hex, size_t hex_len, uint8_t *out,
 	return 0;
 }
 
+static void golioth_mbedtls_psk_selftest(const void *psk_raw, size_t psk_raw_len, const char *psk_id,
+					 size_t psk_id_len)
+{
+	mbedtls_ssl_config conf;
+	int ret;
+
+	mbedtls_ssl_config_init(&conf);
+
+	ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+					  MBEDTLS_SSL_TRANSPORT_DATAGRAM,
+					  MBEDTLS_SSL_PRESET_DEFAULT);
+	if (ret != 0) {
+		printk("[golioth] mbed selftest: ssl_config_defaults rc=%d (-0x%04x)\n", ret,
+		       (unsigned int)(ret < 0 ? -ret : 0));
+		goto done;
+	}
+
+	ret = mbedtls_ssl_conf_psk(&conf, (const unsigned char *)psk_raw, psk_raw_len,
+				   (const unsigned char *)psk_id, psk_id_len);
+	if (ret != 0) {
+		printk("[golioth] mbed selftest: ssl_conf_psk rc=%d (-0x%04x)\n", ret,
+		       (unsigned int)(ret < 0 ? -ret : 0));
+	} else {
+		printk("[golioth] mbed selftest: ssl_conf_psk OK (use this to distinguish "
+		       "mbedTLS vs socket layer)\n");
+	}
+
+done:
+	mbedtls_ssl_config_free(&conf);
+}
+
 static struct golioth_client *golioth_client;
 static K_SEM_DEFINE(golioth_connected_sem, 0, 1);
 
@@ -103,15 +134,14 @@ static const struct golioth_client_config golioth_cfg = {
 
 static int golioth_provision_psk_credentials(void)
 {
-	/* 64-byte key as hex = 128 chars + NUL fits; master used 2 * CONFIG string len */
-	char psk_hex[256];
-	const char hex_digits[] = "0123456789abcdef";
 	const char *psk_id = GOLIOTH_PSK_ID;
 	const char *psk = GOLIOTH_PSK;
 	const size_t psk_id_len = strlen(psk_id);
 	const size_t psk_ascii_len = strlen(psk);
-	const int tag = CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG;
-	uint8_t psk_bin[64];
+	sec_tag_t tag = (sec_tag_t)CONFIG_GOLIOTH_COAP_CLIENT_CREDENTIALS_TAG;
+	uint8_t psk_bin[128];
+	const void *psk_material = psk;
+	size_t psk_len = psk_ascii_len;
 	int err;
 
 	if (psk_id_len == 0 || psk_ascii_len == 0) {
@@ -121,60 +151,55 @@ static int golioth_provision_psk_credentials(void)
 		return -EINVAL;
 	}
 
+	/* Golioth normally shows the secret as 64 or 128 hex nibbles; only those lengths are
+	 * decoded so a 32-char alphanumeric passphrase is not reinterpreted as hex.
+	 */
 	if ((psk_ascii_len == 64U || psk_ascii_len == 128U) &&
 	    golioth_psk_string_is_hex(psk, psk_ascii_len)) {
-		size_t raw_len;
-
 		err = golioth_psk_hex_decode(psk, psk_ascii_len, psk_bin, sizeof(psk_bin),
-					   &raw_len);
+					   &psk_len);
 		if (err) {
-			printk("[golioth] PSK hex decode failed\n");
+			printk("[golioth] PSK hex decode failed (check length / MBEDTLS_PSK_MAX_LEN)\n");
 			return err;
 		}
 
-		if (2U * raw_len + 1U > sizeof(psk_hex)) {
-			return -EINVAL;
-		}
-
-		for (size_t i = 0; i < raw_len; i++) {
-			psk_hex[2 * i] = hex_digits[psk_bin[i] >> 4];
-			psk_hex[2 * i + 1] = hex_digits[psk_bin[i] & 0x0f];
-		}
-		psk_hex[2 * raw_len] = '\0';
-		printk("[golioth] PSK: Golioth hex UI %zu chars -> %zu key bytes -> modem\n",
-		       psk_ascii_len, raw_len);
-	} else {
-		if (psk_ascii_len * 2U + 1U > sizeof(psk_hex)) {
-			printk("[golioth] PSK too long for modem buffer\n");
-			return -EINVAL;
-		}
-
-		for (size_t i = 0; i < psk_ascii_len; i++) {
-			unsigned char value = (unsigned char)psk[i];
-
-			psk_hex[i * 2] = hex_digits[value >> 4];
-			psk_hex[i * 2 + 1] = hex_digits[value & 0x0f];
-		}
-		psk_hex[psk_ascii_len * 2] = '\0';
+		psk_material = psk_bin;
+		printk("[dbg] golioth PSK: hex string %zu chars -> %zu raw bytes\n", psk_ascii_len,
+		       psk_len);
 	}
 
-	/* Ignore delete failures when the credentials do not exist yet. */
-	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,4", tag);
-	(void)nrf_modem_at_printf("AT%%CMNG=3,%d,3", tag);
+	printk("[dbg] golioth PSK provision: sec_tag=%u psk_id_len=%zu psk_len=%zu\n",
+	       (unsigned int)tag, psk_id_len, psk_len);
 
-	err = nrf_modem_at_printf("AT%%CMNG=0,%d,4,\"%s\"", tag, psk_id);
+	/*
+	 * Native mbedTLS DTLS uses Zephyr tls_credential_* (volatile backend). Modem-only
+	 * storage does not expose PSK entries to mbedtls (ENOENT during handshake).
+	 */
+	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK_ID);
+	(void)tls_credential_delete(tag, TLS_CREDENTIAL_PSK);
+
+	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK_ID, psk_id, psk_id_len);
 	if (err) {
-		printk("[golioth] failed to provision PSK ID to sec tag %d: %d\n", tag, err);
+		printk("[golioth] tls_credential_add PSK_ID failed for tag %u: %d\n",
+		       (unsigned int)tag, err);
 		return err;
 	}
 
-	err = nrf_modem_at_printf("AT%%CMNG=0,%d,3,\"%s\"", tag, psk_hex);
+	err = tls_credential_add(tag, TLS_CREDENTIAL_PSK, psk_material, psk_len);
 	if (err) {
-		printk("[golioth] failed to provision PSK to sec tag %d: %d\n", tag, err);
+		printk("[golioth] tls_credential_add PSK failed for tag %u: %d\n",
+		       (unsigned int)tag, err);
 		return err;
 	}
 
-	printk("[golioth] provisioned PSK credentials to modem sec tag %d\n", tag);
+	printk("[golioth] provisioned PSK credentials (volatile) for sec tag %u\n",
+	       (unsigned int)tag);
+
+	/*
+	 * Zephyr maps mbedTLS setup failures to connect() EINVAL (-22). Call mbedTLS
+	 * directly once so the console shows the real mbed error code (e.g. -0x7100).
+	 */
+	golioth_mbedtls_psk_selftest(psk_material, psk_len, psk_id, psk_id_len);
 
 	return 0;
 }
@@ -435,35 +460,29 @@ static void sensor_poll_work_handler(struct k_work *work)
 
 static uint8_t boot_stage_lookup_led_blinks(const char *stage)
 {
-	static const struct {
-		const char *name;
-		uint8_t blinks;
-	} map[] = {
-		{ "main_entry", 1 },
-		{ "date_time_handler_register", 2 },
-		{ "nrf_modem_lib_init_begin", 3 },
-		{ "nrf_modem_lib_init_done", 4 },
-		{ "lte_handler_register", 5 },
-		{ "golioth_psk_provision", 6 },
-		{ "lte_connect_request", 7 },
-		{ "lte_wait_registered", 8 },
-		{ "lte_registered", 9 },
-		{ "gnss_antenna_enable", 10 },
-		{ "network_wait_ready", 11 },
-		{ "golioth_client_create", 12 },
-		{ "golioth_wait_connected", 13 },
-		{ "date_time_wait", 14 },
-		{ "location_init", 15 },
-		{ "location_high_accuracy_start", 16 },
-		{ "location_periodic_running", 17 },
-	};
-
-	for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
-		if (!strcmp(stage, map[i].name)) {
-			return map[i].blinks;
-		}
+	/* Keep LED debug patterns limited to the main boot milestones. */
+	if (!strcmp(stage, "main_entry")) {
+		return 1;
 	}
 
+	if (!strcmp(stage, "lte_connect_request")) {
+		return 2;
+	}
+
+	if (!strcmp(stage, "lte_registered")) {
+		return 3;
+	}
+
+	if (!strcmp(stage, "golioth_wait_connected")) {
+		return 4;
+	}
+
+	if (!strcmp(stage, "location_high_accuracy_start") ||
+	    !strcmp(stage, "location_periodic_running")) {
+		return 5;
+	}
+
+	/* Unmapped intermediate stages use a single blink. */
 	return 1;
 }
 
@@ -477,6 +496,7 @@ static bool boot_led_ready;
 #define BOOT_LED_GROUP_GAP_MS    1500
 #define BOOT_LED_FIRST_GAP_MS    450
 #define BOOT_LED_STAGECHG_GAP_MS 280
+#define BOOT_LED_MAX_BLINKS      5U
 
 enum boot_led_phase {
 	BOOT_LED_PHASE_GAP = 0,
@@ -518,8 +538,8 @@ static void boot_led_work_handler(struct k_work *work)
 
 	uint8_t n = boot_led_pattern_blinks;
 
-	if (n > 24U) {
-		n = 24U;
+	if (n > BOOT_LED_MAX_BLINKS) {
+		n = BOOT_LED_MAX_BLINKS;
 	}
 
 	if (!boot_led_ready) {
@@ -572,7 +592,8 @@ static void boot_mark(const char *stage)
 	       led_n == 1U ? "" : "s", k_uptime_get());
 
 #if DT_NODE_HAS_STATUS(BOOT_LED_NODE, okay)
-	boot_led_pattern_blinks = led_n > 24U ? 24U : (uint8_t)led_n;
+	boot_led_pattern_blinks = led_n > BOOT_LED_MAX_BLINKS ? BOOT_LED_MAX_BLINKS :
+		(uint8_t)led_n;
 	boot_led_notify_stage_changed();
 #endif
 }
@@ -855,7 +876,7 @@ static bool lte_is_registered(void)
 static int enable_onboard_gnss_antenna_if_needed(void)
 {
 #if defined(CONFIG_GPS_SAMPLE_ANTENNA_ONBOARD)
-	static const char coex0_cmd[] = "AT%XCOEX0=1,1,1565,1586";
+	static const char coex0_cmd[] = CONFIG_GPS_SAMPLE_AT_COEX0;
 	int err = nrf_modem_at_printf("%s", coex0_cmd);
 
 	if (err) {
@@ -873,11 +894,14 @@ static int enable_onboard_gnss_antenna_if_needed(void)
 
 static void location_event_handler(const struct location_event_data *event_data)
 {
+	bool request_done = false;
+
 	printk("[location] event id=%d method=%s\n",
 	       event_data->id, location_method_str(event_data->method));
 
 	switch (event_data->id) {
 	case LOCATION_EVT_LOCATION:
+		request_done = true;
 		gnss_progress_stop("fix");
 		printk("Got location:\n");
 		printk("  method: %s\n", location_method_str(event_data->method));
@@ -905,6 +929,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 
 	case LOCATION_EVT_TIMEOUT:
+		request_done = true;
 		gnss_progress_stop("timeout");
 		printk("Getting location timed out\n\n");
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
@@ -913,6 +938,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 
 	case LOCATION_EVT_ERROR:
+		request_done = true;
 		gnss_progress_stop("error");
 		printk("Getting location failed\n\n");
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
@@ -934,89 +960,40 @@ static void location_event_handler(const struct location_event_data *event_data)
 #endif
 		break;
 
+	case LOCATION_EVT_RESULT_UNKNOWN:
+		request_done = true;
+		gnss_progress_stop("unknown");
+		printk("Location result unknown\n\n");
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+		publish_status_to_golioth("location_unknown", -EAGAIN);
+#endif
+		break;
+
+	case LOCATION_EVT_CLOUD_LOCATION_EXT_REQUEST:
+		printk("Cloud external location request event received (external service mode).\n\n");
+		break;
+
+	case LOCATION_EVT_FALLBACK:
+		printk("Location method fallback occurred, request still in progress.\n\n");
+		break;
+
+	case LOCATION_EVT_STARTED:
+		printk("Location request started.\n\n");
+		break;
+
 	default:
 		printk("Getting location: Unknown event\n\n");
 		break;
 	}
 
-	k_sem_give(&location_event);
+	if (request_done) {
+		k_sem_give(&location_event);
+	}
 }
 
 static void location_event_wait(void)
 {
 	k_sem_take(&location_event, K_FOREVER);
-}
-
-/**
- * @brief Retrieve location so that fallback is applied.
- *
- * @details This is achieved by setting GNSS as first priority method and giving it too short
- * timeout. Then a fallback to next method, which is cellular in this example, occurs.
- */
-static void location_with_fallback_get(void)
-{
-	int err;
-	struct location_config config;
-	enum location_method methods[] = {LOCATION_METHOD_GNSS, LOCATION_METHOD_CELLULAR};
-
-	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
-	/* GNSS timeout is set to 1 second to force a failure. */
-	config.methods[0].gnss.timeout = 1 * MSEC_PER_SEC;
-	/* Default cellular configuration may be overridden here. */
-	config.methods[1].cellular.timeout = 40 * MSEC_PER_SEC;
-
-	printk("Requesting location with short GNSS timeout to trigger fallback to cellular...\n");
-
-	err = location_request(&config);
-	if (err) {
-		printk("Requesting location failed, error: %d\n", err);
-		return;
-	}
-
-	location_event_wait();
-}
-
-/**
- * @brief Retrieve location with default configuration.
- *
- * @details This is achieved by not passing configuration at all to location_request().
- */
-static void location_default_get(void)
-{
-	int err;
-
-	printk("Requesting location with the default configuration...\n");
-
-	err = location_request(NULL);
-	if (err) {
-		printk("Requesting location failed, error: %d\n", err);
-		return;
-	}
-
-	location_event_wait();
-}
-
-/**
- * @brief Retrieve location with GNSS low accuracy.
- */
-static void location_gnss_low_accuracy_get(void)
-{
-	int err;
-	struct location_config config;
-	enum location_method methods[] = {LOCATION_METHOD_GNSS};
-
-	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
-	config.methods[0].gnss.accuracy = LOCATION_ACCURACY_LOW;
-
-	printk("Requesting low accuracy GNSS location...\n");
-
-	err = location_request(&config);
-	if (err) {
-		printk("Requesting location failed, error: %d\n", err);
-		return;
-	}
-
-	location_event_wait();
 }
 
 /**
@@ -1026,13 +1003,15 @@ static void location_gnss_high_accuracy_get(void)
 {
 	int err;
 	struct location_config config;
-	enum location_method methods[] = {LOCATION_METHOD_GNSS};
+	enum location_method methods[] = {LOCATION_METHOD_GNSS, LOCATION_METHOD_CELLULAR};
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 	config.methods[0].gnss.accuracy = LOCATION_ACCURACY_HIGH;
+	/* Allow GNSS to run long enough for good fixes, then fall back to cellular. */
 	config.methods[0].gnss.timeout = 8 * 60 * MSEC_PER_SEC;
+	config.methods[1].cellular.timeout = 45 * MSEC_PER_SEC;
 
-	printk("Requesting high accuracy GNSS location...\n");
+	printk("Requesting high accuracy GNSS location with cellular fallback...\n");
 
 	err = location_request(&config);
 	if (err) {
@@ -1074,19 +1053,20 @@ static void location_wifi_get(void)
 #endif
 
 /**
- * @brief Retrieve location periodically using GNSS only.
+ * @brief Retrieve location periodically using GNSS with cellular fallback.
  */
 static void location_gnss_periodic_get(void)
 {
 	int err;
 	struct location_config config;
-	enum location_method methods[] = {LOCATION_METHOD_GNSS};
+	enum location_method methods[] = {LOCATION_METHOD_GNSS, LOCATION_METHOD_CELLULAR};
 
 	location_config_defaults_set(&config, ARRAY_SIZE(methods), methods);
 	config.interval = 30;
-	config.methods[0].gnss.timeout = 4 * 60 * MSEC_PER_SEC;
+	config.methods[0].gnss.timeout = 8 * 60 * MSEC_PER_SEC;
+	config.methods[1].cellular.timeout = 45 * MSEC_PER_SEC;
 
-	printk("Requesting 30s periodic GNSS location...\n");
+	printk("Requesting 30s periodic GNSS location with cellular fallback...\n");
 
 	err = location_request(&config);
 	if (err) {
@@ -1163,7 +1143,7 @@ int main(void)
 	log_modem_snapshot("AT%XMODEMUUID", "MODEMUUID");
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
-	/* Modem sec tag PSK via AT%%CMNG before LTE (matches master / stratus9161 path). */
+	/* Register PSK in Zephyr TLS store before Golioth DTLS (after modem AT probe). */
 	boot_mark("golioth_psk_provision");
 	err = golioth_provision_psk_credentials();
 	if (err) {

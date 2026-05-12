@@ -146,6 +146,31 @@ Larger pairs (e.g. **98304 + 65536**) were tried to kill **ENOMEM (-12)** but **
 
 MCUboot sysbuild may use **`-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160`** (secure board for bootloader image).
 
+**Exact command used for the successful 9160 build (copy/paste):**
+
+```powershell
+$env:ZEPHYR_BASE="C:/ncs/v3.2.0/zephyr"
+$env:ZEPHYR_TOOLCHAIN_VARIANT="zephyr"
+$env:ZEPHYR_SDK_INSTALL_DIR="C:/ncs/toolchains/66cdf9b75e/opt/zephyr-sdk"
+& "C:/ncs/toolchains/66cdf9b75e/opt/bin/Scripts/west" build --sysbuild -p always -d build_9160_check -b conexio_stratus_pro/nrf9160/ns -- "-DBOARD_ROOT=C:/Users/Brian/location/conexio_board_root_v3" "-DZEPHYR_EXTRA_MODULES=C:/ncs/v3.2.0/modules/lib/golioth-firmware-sdk" "-DEXTRA_CONF_FILE=overlay-golioth.conf;credentials.conf"
+```
+
+### Pre-flight checklist (before building in a new place)
+
+- Confirm branch is correct and clean (`git branch --show-current`, `git status --short`).
+- Confirm board target is **`conexio_stratus_pro/nrf9160/ns`**.
+- Confirm local credentials file exists and has the intended device's PSK/PSK-ID (`credentials.conf`).
+- Confirm `overlay-golioth.conf` includes CoAP path-length support:
+	- `CONFIG_COAP_EXTENDED_OPTIONS_LEN=y`
+	- `CONFIG_COAP_EXTENDED_OPTIONS_LEN_VALUE=32`
+- Confirm Golioth module path exists: `C:/ncs/v3.2.0/modules/lib/golioth-firmware-sdk`.
+- Confirm build env vars are set in the active shell:
+	- `ZEPHYR_BASE=C:/ncs/v3.2.0/zephyr`
+	- `ZEPHYR_TOOLCHAIN_VARIANT=zephyr`
+	- `ZEPHYR_SDK_INSTALL_DIR=C:/ncs/toolchains/66cdf9b75e/opt/zephyr-sdk`
+- Rebuild with `-p always` to avoid stale artifacts.
+- Flash/upload from the same build directory you just produced (`build_9160_check`).
+
 ---
 
 ## 6. Items tried or rejected during debugging
@@ -176,3 +201,39 @@ MCUboot sysbuild may use **`-Dmcuboot_BOARD=conexio_stratus_pro/nrf9160`** (secu
 - If **ENOMEM (-12)** reappears after further changes: increase heaps only within linker margin, or raise **`CONFIG_GOLIOTH_COAP_THREAD_STACK_SIZE`**, or trim other RAM consumers.
 - If connect succeeds: validate **LightDB stream** payloads and consider removing or `#ifdef`-gating **`golioth_mbedtls_psk_selftest()`** for production boot time and log noise.
 - **Production**: replace MCUboot default signing key, add **`pm_static.yml`** if required by release policy, and keep **`credentials.conf`** out of version control.
+
+---
+
+## 9. Golioth telemetry publish failure — `Path too long: 18 > 12` ✅ FIXED
+
+### Symptom
+
+After Golioth connected successfully on `conexio_stratus_pro/nrf9160/ns`, the serial log showed:
+
+```
+[00:00:21.014,770] <err> golioth_coap_client: Path too long: 18 > 12
+[golioth] telemetry/snapshot publish failed: 6
+```
+
+Every periodic telemetry publish was silently dropped. Location publishes to short paths (`loc/fix`, `loc/stat`) still worked because those are ≤ 7 characters.
+
+### Root cause
+
+`CONFIG_GOLIOTH_COAP_CLIENT_MAX_PATH_LEN` defaults to **12** in the Golioth Firmware SDK. The application publishes sensor + accelerometer + location snapshots to the path `telemetry/snapshot`, which is **18 characters** — 6 over the limit. The SDK rejects the publish with error code 6 (`GOLIOTH_ERR_INVALID_FORMAT`) and logs "Path too long".
+
+This is a compile-time Kconfig that caps the internal CoAP path buffer; it is not enforced at the Golioth cloud side. The fix is simply to raise it in the overlay.
+
+### Fix applied — `overlay-golioth.conf`
+
+```kconfig
+# Raise max CoAP path length to accommodate paths like "telemetry/snapshot" (18 chars).
+# GOLIOTH_COAP_MAX_PATH_LEN is a derived (no-prompt) symbol driven by these two Zephyr CoAP symbols.
+CONFIG_COAP_EXTENDED_OPTIONS_LEN=y
+CONFIG_COAP_EXTENDED_OPTIONS_LEN_VALUE=32
+```
+
+Set to **32** to give comfortable headroom for any future longer paths without meaningfully increasing RAM usage (the buffer is stack-allocated per request, not a global pool).
+
+### How to avoid this in future
+
+Any LightDB Stream path used in `golioth_stream_set()` or `golioth_stream_set_async()` must fit within `CONFIG_GOLIOTH_COAP_CLIENT_MAX_PATH_LEN`. Count the full path string including slashes (e.g. `telemetry/snapshot` = 18). Set the config ≥ your longest path. The default of 12 only fits very short single-segment paths.
