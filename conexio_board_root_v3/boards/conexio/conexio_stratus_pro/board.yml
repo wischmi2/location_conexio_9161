@@ -3,6 +3,6 @@ board:
   full_name: Conexio Stratus Pro
   vendor: conexio
   socs:
-  - name: nrf9161
+  - name: nrf9160
     variants:
     - name: ns

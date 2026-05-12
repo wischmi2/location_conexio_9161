@@ -33,34 +33,6 @@ config GPS_SAMPLE_AT_COEX0
 	help
 	  AT command sent when GPS_SAMPLE_ANTENNA_ONBOARD is enabled.
 
-config GPS_SAMPLE_AT_MAGPIO
-	string "Optional AT%XMAGPIO command for GNSS RF path"
-	default ""
-	help
-	  Optional board-specific AT command sent before COEX0 to configure
-	  MAGPIO/RF routing for GNSS. Leave empty if not required.
-
-config GPS_SAMPLE_AT_MIPIRFFEDEV
-	string "Optional AT%XMIPIRFFEDEV command for GNSS RF path"
-	default ""
-	help
-	  Optional board-specific AT command sent before COEX0 to configure
-	  MIPI-RFFE device mapping. Leave empty if not required.
-
-config GPS_SAMPLE_AT_MIPIRFFECTRL_INIT
-	string "Optional AT%XMIPIRFFECTRL INIT command for GNSS RF path"
-	default ""
-	help
-	  Optional board-specific AT command sent before COEX0 to set MIPI-RFFE
-	  control for the INIT state. Leave empty if not required.
-
-config GPS_SAMPLE_AT_MIPIRFFECTRL_ON
-	string "Optional AT%XMIPIRFFECTRL ON command for GNSS RF path"
-	default ""
-	help
-	  Optional board-specific AT command sent before COEX0 to set MIPI-RFFE
-	  control for the ON state. Leave empty if not required.
-
 endmenu
 
 menu "Zephyr Kernel"
