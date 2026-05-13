@@ -41,6 +41,16 @@
 		};
 	};
 
+	/* Solar Energy Click INT (active-low status on Stratus shield routing). */
+	solar_inputs {
+		compatible = "gpio-keys";
+		solar_int: solar_int {
+			gpios = <&gpio0 29 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Solar INT";
+			zephyr,code = <INPUT_KEY_1>;
+		};
+	};
+
 	stratus_header: connector {
 		compatible = "conexio-stratus-header";
 		#gpio-cells = <2>;
@@ -82,6 +92,7 @@
 		led0 = &led0;
 		pwm-led0 = &pwm_led0;
 		sw0 = &button0;
+		solar-int = &solar_int;
 		sht40 = &sht40;
 		accel0 = &lis2dh12_ext;
 		bootloader-led0 = &led0;

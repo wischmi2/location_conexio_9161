@@ -13,6 +13,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/printk.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
 #include <modem/location.h>
@@ -374,6 +375,101 @@ static struct k_work_delayable boot_heartbeat_work;
 static bool modem_ready_for_debug;
 static const char *boot_stage = "reset";
 static struct k_work_delayable boot_led_work;
+
+#define SOLAR_INT_NODE DT_ALIAS(solar_int)
+#if DT_NODE_HAS_STATUS(SOLAR_INT_NODE, okay)
+static const struct gpio_dt_spec solar_int = GPIO_DT_SPEC_GET(SOLAR_INT_NODE, gpios);
+static struct gpio_callback solar_int_cb;
+static struct k_work_delayable solar_int_work;
+static int solar_int_last_level = -1;
+
+static void solar_int_publish_level(int level)
+{
+	/* INT is active-low per Solar Energy Click behavior. */
+	const bool low_battery = (level == 0);
+
+	printk("[solar] INT level=%d -> %s\n", level,
+	       low_battery ? "low-battery" : "battery-recovered");
+
+#if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
+	if (low_battery) {
+		publish_status_to_golioth("solar_int_low_battery", 2850);
+	} else {
+		publish_status_to_golioth("solar_int_recovered", 3250);
+	}
+#endif
+}
+
+static void solar_int_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	int level = gpio_pin_get_dt(&solar_int);
+
+	if (level < 0) {
+		printk("[solar] failed to read INT pin: %d\n", level);
+		return;
+	}
+
+	if (solar_int_last_level != level) {
+		solar_int_last_level = level;
+		solar_int_publish_level(level);
+	}
+}
+
+static void solar_int_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	/* Debounce/suppress chatter from threshold transitions. */
+	k_work_reschedule(&solar_int_work, K_MSEC(25));
+}
+
+static int solar_int_init(void)
+{
+	int err;
+
+	k_work_init_delayable(&solar_int_work, solar_int_work_handler);
+
+	if (!gpio_is_ready_dt(&solar_int)) {
+		printk("[solar] INT gpio not ready\n");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&solar_int, GPIO_INPUT);
+	if (err) {
+		printk("[solar] INT pin config failed: %d\n", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&solar_int, GPIO_INT_EDGE_BOTH);
+	if (err) {
+		printk("[solar] INT interrupt config failed: %d\n", err);
+		return err;
+	}
+
+	gpio_init_callback(&solar_int_cb, solar_int_callback, BIT(solar_int.pin));
+	err = gpio_add_callback(solar_int.port, &solar_int_cb);
+	if (err) {
+		printk("[solar] INT callback add failed: %d\n", err);
+		return err;
+	}
+
+	/* Capture initial state at boot. */
+	k_work_reschedule(&solar_int_work, K_NO_WAIT);
+	printk("[solar] INT monitoring enabled on P0.%u\n", solar_int.pin);
+
+	return 0;
+}
+#else
+static int solar_int_init(void)
+{
+	printk("[solar] no solar_int alias in devicetree; INT monitoring disabled\n");
+	return 0;
+}
+#endif
 
 #if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
 static const struct device *const sht40_dev = DEVICE_DT_GET(DT_ALIAS(sht40));
@@ -1084,6 +1180,10 @@ int main(void)
 	k_work_init_delayable(&gnss_progress_work, gnss_progress_work_handler);
 	k_work_init_delayable(&boot_heartbeat_work, boot_heartbeat_work_handler);
 	k_work_init_delayable(&boot_led_work, boot_led_work_handler);
+	err = solar_int_init();
+	if (err) {
+		printk("[solar] INT initialization failed: %d\n", err);
+	}
 
 #if (IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)) || \
 	(IS_ENABLED(CONFIG_LIS2DH) && DT_NODE_HAS_STATUS(DT_ALIAS(accel0), okay))

@@ -237,3 +237,46 @@ Set to **32** to give comfortable headroom for any future longer paths without m
 ### How to avoid this in future
 
 Any LightDB Stream path used in `golioth_stream_set()` or `golioth_stream_set_async()` must fit within `CONFIG_GOLIOTH_COAP_CLIENT_MAX_PATH_LEN`. Count the full path string including slashes (e.g. `telemetry/snapshot` = 18). Set the config ≥ your longest path. The default of 12 only fits very short single-segment paths.
+
+---
+
+## 10. Solar Energy Click INT support — routed indicator + interrupt-driven status
+
+### What was added
+
+- Added Solar Energy Click INT support as a board-level GPIO input on the Conexio Stratus Pro nRF9160 board.
+- Added a devicetree-backed Solar INT node and alias so application code can refer to the signal through DT instead of hardcoded pin numbers.
+- Added runtime GPIO interrupt handling in `src/main.c` with:
+	- input configuration,
+	- edge-triggered interrupts on both transitions,
+	- debounce/recheck work item,
+	- initial boot-time state capture,
+	- console logging for low-battery and recovery transitions.
+- Added Golioth status publish hooks for Solar INT transitions when Golioth is enabled.
+
+### Hardware behavior captured
+
+- MikroE product-page behavior confirmed that Solar Energy Click INT is routed to mikroBUS INT.
+- The INT line is driven LOW when the battery voltage drops below 2.85 V.
+- The INT line returns high again around 3.25 V due to hysteresis.
+- This makes INT a useful active-low low-battery / recovery indicator instead of a polling-only signal.
+
+### Board and firmware files changed
+
+- `conexio_board_root_v3/boards/conexio/conexio_stratus_pro/conexio_stratus_pro_common.dtsi`
+	- added Solar INT devicetree node and alias.
+- `src/main.c`
+	- added Solar INT GPIO setup, interrupt callback, delayed debounce processing, and status logging.
+- `docs/solar_energy_click/SOLAR_ENERGY_CLICK_9160_CONTROLS_AND_INDICATORS.md`
+	- added detailed INT-pin behavior and firmware integration guidance.
+
+### Build result
+
+- The INT integration was validated with a full `west build --sysbuild -p always` run for `conexio_stratus_pro/nrf9160/ns`.
+- The build completed successfully after fixing devicetree aliasing and GPIO node structure issues.
+
+### Notes for future code changes
+
+- INT should be treated as active-low for low-battery indication.
+- Use the Solar INT event as a trigger to sample the analog solar input again so state transitions can be cross-checked.
+- If more status pins are routed later, keep them in devicetree and avoid hardcoded pin numbers in application logic.
