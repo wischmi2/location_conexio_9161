@@ -9,4 +9,7 @@ cmake_minimum_required(VERSION 3.20)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(location)
 
-zephyr_library_sources(src/main.c)
+zephyr_library_sources(
+	src/main.c
+	src/solar_click.c
+)

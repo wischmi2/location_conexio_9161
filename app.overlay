@@ -1,0 +1,34 @@
+/*
+ * Project-specific Solar Energy Click pin mapping for Conexio Stratus Pro nRF9160 NS.
+ *
+ * Routes per schematics:
+ * - INT/VBAT_OK -> P0.16
+ * - AN/VOUT_EN  -> P0.17
+ * - CS/EN       -> P0.18
+ */
+
+/* Override board default solar_int mapping (currently P0.29 in board dtsi). */
+&solar_int {
+	gpios = <&gpio0 16 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+};
+
+/ {
+	solar_ctrls {
+		compatible = "gpio-leds";
+
+		solar_vout_en: solar_vout_en {
+			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+			label = "Solar VOUT_EN";
+		};
+
+		solar_en: solar_en {
+			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
+			label = "Solar EN";
+		};
+	};
+
+	aliases {
+		solar-vout-en = &solar_vout_en;
+		solar-en = &solar_en;
+	};
+};

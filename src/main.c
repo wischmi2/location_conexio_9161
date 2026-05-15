@@ -11,6 +11,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/printk.h>
@@ -19,6 +20,8 @@
 #include <modem/location.h>
 #include <modem/nrf_modem_lib.h>
 #include <date_time.h>
+
+#include "solar_click.h"
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
 #include <mbedtls/ssl.h>
@@ -375,20 +378,21 @@ static struct k_work_delayable boot_heartbeat_work;
 static bool modem_ready_for_debug;
 static const char *boot_stage = "reset";
 static struct k_work_delayable boot_led_work;
+static struct k_work_delayable solar_cli_work;
 
-#define SOLAR_INT_NODE DT_ALIAS(solar_int)
-#if DT_NODE_HAS_STATUS(SOLAR_INT_NODE, okay)
-static const struct gpio_dt_spec solar_int = GPIO_DT_SPEC_GET(SOLAR_INT_NODE, gpios);
-static struct gpio_callback solar_int_cb;
-static struct k_work_delayable solar_int_work;
-static int solar_int_last_level = -1;
+#define SOLAR_CLI_MAX_CMD_LEN 64
+static char solar_cli_cmd_buf[SOLAR_CLI_MAX_CMD_LEN];
+static size_t solar_cli_cmd_len;
 
-static void solar_int_publish_level(int level)
+#if DT_HAS_CHOSEN(zephyr_console)
+static const struct device *const solar_cli_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+#endif
+
+static void solar_vbat_ok_handler(bool low_battery, int level, void *user_data)
 {
-	/* INT is active-low per Solar Energy Click behavior. */
-	const bool low_battery = (level == 0);
+	ARG_UNUSED(user_data);
 
-	printk("[solar] INT level=%d -> %s\n", level,
+	printk("[solar] VBAT_OK event: level=%d (%s)\n", level,
 	       low_battery ? "low-battery" : "battery-recovered");
 
 #if defined(CONFIG_GOLIOTH_FIRMWARE_SDK)
@@ -400,76 +404,139 @@ static void solar_int_publish_level(int level)
 #endif
 }
 
-static void solar_int_work_handler(struct k_work *work)
+static void solar_cli_print_help(void)
 {
-	ARG_UNUSED(work);
+	printk("[solar-cli] commands:\n");
+	printk("[solar-cli]   solar help\n");
+	printk("[solar-cli]   solar read\n");
+	printk("[solar-cli]   solar en 0|1\n");
+	printk("[solar-cli]   solar vout 0|1\n");
+}
 
-	int level = gpio_pin_get_dt(&solar_int);
+static void solar_cli_handle_command(char *cmd)
+{
+	char *argv0;
+	char *argv1;
+	char *argv2;
+	char *argv3;
+	int err;
 
-	if (level < 0) {
-		printk("[solar] failed to read INT pin: %d\n", level);
+	while (*cmd == ' ' || *cmd == '\t') {
+		cmd++;
+	}
+
+	if (*cmd == '\0') {
 		return;
 	}
 
-	if (solar_int_last_level != level) {
-		solar_int_last_level = level;
-		solar_int_publish_level(level);
+	argv0 = strtok(cmd, " \t");
+	argv1 = strtok(NULL, " \t");
+	argv2 = strtok(NULL, " \t");
+	argv3 = strtok(NULL, " \t");
+
+	if (!argv0 || strcmp(argv0, "solar") != 0) {
+		printk("[solar-cli] unknown command. try 'solar help'\n");
+		return;
 	}
+
+	if (!argv1 || strcmp(argv1, "help") == 0) {
+		solar_cli_print_help();
+		return;
+	}
+
+	if (strcmp(argv1, "read") == 0) {
+		int level;
+
+		err = solar_click_get_vbat_ok_level(&level);
+		if (err) {
+			printk("[solar-cli] read failed: %d\n", err);
+			return;
+		}
+
+		printk("[solar-cli] VBAT_OK level=%d (%s)\n", level,
+		       level == 0 ? "low-battery" : "battery-recovered");
+		return;
+	}
+
+	if (strcmp(argv1, "en") == 0 || strcmp(argv1, "vout") == 0) {
+		const bool is_en = (strcmp(argv1, "en") == 0);
+		const bool enable = (argv2 && strcmp(argv2, "1") == 0);
+
+		if (!argv2 || argv3 || (strcmp(argv2, "0") != 0 && strcmp(argv2, "1") != 0)) {
+			printk("[solar-cli] usage: solar %s 0|1\n", is_en ? "en" : "vout");
+			return;
+		}
+
+		err = is_en ? solar_click_set_en(enable) : solar_click_set_vout_enabled(enable);
+		if (err) {
+			printk("[solar-cli] %s set failed: %d\n", is_en ? "EN" : "VOUT_EN", err);
+			return;
+		}
+
+		printk("[solar-cli] %s set to %d\n", is_en ? "EN" : "VOUT_EN", enable ? 1 : 0);
+		return;
+	}
+
+	printk("[solar-cli] unknown solar command. try 'solar help'\n");
 }
 
-static void solar_int_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static void solar_cli_work_handler(struct k_work *work)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
+	ARG_UNUSED(work);
 
-	/* Debounce/suppress chatter from threshold transitions. */
-	k_work_reschedule(&solar_int_work, K_MSEC(25));
+#if DT_HAS_CHOSEN(zephyr_console)
+	uint8_t c;
+
+	while (uart_poll_in(solar_cli_uart, &c) == 0) {
+		if (c == '\r' || c == '\n') {
+			if (solar_cli_cmd_len > 0) {
+				solar_cli_cmd_buf[solar_cli_cmd_len] = '\0';
+				solar_cli_handle_command(solar_cli_cmd_buf);
+				solar_cli_cmd_len = 0;
+			}
+			continue;
+		}
+
+		if ((c == '\b' || c == 0x7F) && solar_cli_cmd_len > 0) {
+			solar_cli_cmd_len--;
+			continue;
+		}
+
+		if (!isprint(c)) {
+			continue;
+		}
+
+		if (solar_cli_cmd_len < (sizeof(solar_cli_cmd_buf) - 1U)) {
+			solar_cli_cmd_buf[solar_cli_cmd_len++] = (char)c;
+		} else {
+			/* Reset on overflow to avoid parsing a partial command forever. */
+			solar_cli_cmd_len = 0;
+			printk("[solar-cli] command too long; cleared input buffer\n");
+		}
+	}
+#endif
+
+	k_work_reschedule(&solar_cli_work, K_MSEC(100));
 }
 
-static int solar_int_init(void)
+static int solar_cli_init(void)
 {
-	int err;
+	k_work_init_delayable(&solar_cli_work, solar_cli_work_handler);
 
-	k_work_init_delayable(&solar_int_work, solar_int_work_handler);
-
-	if (!gpio_is_ready_dt(&solar_int)) {
-		printk("[solar] INT gpio not ready\n");
+#if DT_HAS_CHOSEN(zephyr_console)
+	if (!device_is_ready(solar_cli_uart)) {
+		printk("[solar-cli] console UART not ready; CLI disabled\n");
 		return -ENODEV;
 	}
 
-	err = gpio_pin_configure_dt(&solar_int, GPIO_INPUT);
-	if (err) {
-		printk("[solar] INT pin config failed: %d\n", err);
-		return err;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&solar_int, GPIO_INT_EDGE_BOTH);
-	if (err) {
-		printk("[solar] INT interrupt config failed: %d\n", err);
-		return err;
-	}
-
-	gpio_init_callback(&solar_int_cb, solar_int_callback, BIT(solar_int.pin));
-	err = gpio_add_callback(solar_int.port, &solar_int_cb);
-	if (err) {
-		printk("[solar] INT callback add failed: %d\n", err);
-		return err;
-	}
-
-	/* Capture initial state at boot. */
-	k_work_reschedule(&solar_int_work, K_NO_WAIT);
-	printk("[solar] INT monitoring enabled on P0.%u\n", solar_int.pin);
-
+	k_work_reschedule(&solar_cli_work, K_MSEC(100));
+	printk("[solar-cli] ready; type 'solar help'\n");
 	return 0;
-}
 #else
-static int solar_int_init(void)
-{
-	printk("[solar] no solar_int alias in devicetree; INT monitoring disabled\n");
+	printk("[solar-cli] no zephyr,console chosen node; CLI disabled\n");
 	return 0;
-}
 #endif
+}
 
 #if IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)
 static const struct device *const sht40_dev = DEVICE_DT_GET(DT_ALIAS(sht40));
@@ -1180,9 +1247,19 @@ int main(void)
 	k_work_init_delayable(&gnss_progress_work, gnss_progress_work_handler);
 	k_work_init_delayable(&boot_heartbeat_work, boot_heartbeat_work_handler);
 	k_work_init_delayable(&boot_led_work, boot_led_work_handler);
-	err = solar_int_init();
+	err = solar_click_register_vbat_ok_handler(solar_vbat_ok_handler, NULL);
 	if (err) {
-		printk("[solar] INT initialization failed: %d\n", err);
+		printk("[solar] VBAT_OK handler registration failed: %d\n", err);
+	}
+
+	err = solar_click_init();
+	if (err) {
+		printk("[solar] initialization failed: %d\n", err);
+	}
+
+	err = solar_cli_init();
+	if (err) {
+		printk("[solar-cli] initialization failed: %d\n", err);
 	}
 
 #if (IS_ENABLED(CONFIG_SHT4X) && DT_NODE_HAS_STATUS(DT_ALIAS(sht40), okay)) || \
